@@ -207,6 +207,7 @@ async function extractAssetUrls(page) {
 // ── Clickable element selectors ────────────────────────────────────────────
 
 const CLICKABLE_SELECTORS = [
+  // Specific navigation selectors
   "nav a", "nav button",
   "[class*='sidebar'] a", "[class*='sidebar'] button",
   "[class*='Sidebar'] a", "[class*='Sidebar'] button",
@@ -221,6 +222,8 @@ const CLICKABLE_SELECTORS = [
   ".MuiListItem-root", ".MuiListItemButton-root",
   ".MuiTab-root", ".MuiButton-root",
   "[class*='ListItem'] a", "[class*='ListItem'] button",
+  // Generic button/link selectors (for Figma sites with generic Tailwind classes)
+  "button", "a[href]",
 ].join(", ");
 
 // ── Content fingerprinting ──────────────────────────────────────────────────
@@ -270,11 +273,24 @@ function labelToRouteKey(label) {
   ];
   if (skipPatterns.some(p => p.test(label))) return null;
 
-  // MUI sidebar items have format: "icon_name LABEL" (e.g., "palette Colors")
-  // Strip the icon prefix — icon names are ALWAYS lowercase with underscores
-  let cleaned = label.replace(/^[a-z_]+\s+/, "").trim();
+  // Strip icon prefixes. Three formats:
+  // 1. "palette Colors" (lowercase icon + space + Label)
+  // 2. "paletteColors" (camelCase: lowercase icon + CamelLabel)
+  // 3. "text_fieldsTypography" (snake_case icon + CamelLabel)
+  let cleaned = label;
+
+  // Format 1: "palette Colors" → "Colors"
+  cleaned = cleaned.replace(/^[a-z_]+\s+/, "").trim();
+
+  // Format 2 & 3: "paletteColors" or "text_fieldsTypography" → "Colors" or "Typography"
+  // Match lowercase/underscore prefix up to first uppercase letter
+  if (!cleaned.includes(" ")) {
+    cleaned = cleaned.replace(/^[a-z_]+(?=[A-Z])/, "");
+  }
+
   if (!cleaned) cleaned = label.trim();
-  // Convert to slug: "Status Chips" → "status-chips"
+
+  // Convert to slug: "Status Chips" → "status-chips", "Colors" → "colors"
   const slug = cleaned
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -296,9 +312,18 @@ async function seedSidebarRoutesFromPage(page) {
   const labels = await page.evaluate((selector) => {
     const elements = document.querySelectorAll(selector);
     const texts = new Set();
+    const navKeywords = ['overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation', 'home', 'about', 'docs'];
+
     elements.forEach((el) => {
       const t = (el.textContent || "").trim().replace(/\s+/g, " ");
-      if (t.length > 0 && t.length < 100) texts.add(t); // skip huge chunks
+      // Filter: only include if it contains navigation keywords or is short (likely a nav label)
+      if (t.length > 0 && t.length < 100) {
+        const hasNavKeyword = navKeywords.some(kw => t.toLowerCase().includes(kw));
+        const isShortLabel = t.length < 50 && !t.includes('  '); // likely a navigation label
+        if (hasNavKeyword || isShortLabel) {
+          texts.add(t);
+        }
+      }
     });
     return Array.from(texts);
   }, CLICKABLE_SELECTORS);
@@ -360,8 +385,21 @@ async function discoverAndCapture(page, requestContext, fromKey) {
 
   // 2. Click nav elements: capture content right when we navigate
   //    Detect BOTH url changes AND content-only changes
-  const clickTargets = await page.$$(CLICKABLE_SELECTORS);
-  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable nav elements`);
+  const allClickTargets = await page.$$(CLICKABLE_SELECTORS);
+
+  // Filter to only navigation-looking elements
+  const navKeywords = ['overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation', 'home', 'about', 'docs', 'guide', 'api', 'settings'];
+  const clickTargets = [];
+  for (const el of allClickTargets) {
+    const text = await el.evaluate(e => (e.textContent || "").trim());
+    const lowerText = text.toLowerCase();
+    // Include if: has nav keyword, or is short and single-word/phrase (< 30 chars)
+    if (navKeywords.some(kw => lowerText.includes(kw)) || (text.length > 0 && text.length < 30 && !lowerText.includes('collapse') && !lowerText.includes('view ai'))) {
+      clickTargets.push(el);
+    }
+  }
+
+  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable nav elements (filtered from ${allClickTargets.length})`);
 
   // Track labels we've already clicked to avoid duplicates
   const clickedLabels = new Set();
@@ -605,9 +643,10 @@ async function clickMatchingSidebarItem(page, hashPath) {
     hashPath,
   ].filter(Boolean);
 
+  const buttons = await page.$$(CLICKABLE_SELECTORS);
+
   for (const term of searchTerms) {
     try {
-      const buttons = await page.$$(CLICKABLE_SELECTORS);
       for (const btn of buttons) {
         const text = await btn.evaluate(e => (e.textContent || "").trim().toLowerCase());
         if (text.includes(term.toLowerCase())) {
