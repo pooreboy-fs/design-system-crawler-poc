@@ -105,8 +105,19 @@ function isInternalUrl(href) {
 
 async function downloadAsset(assetUrl, requestContext) {
   if (downloadedAssets.has(assetUrl)) return downloadedAssets.get(assetUrl);
+
+  // Skip downloading Google Fonts and other CDN font resources
+  // These should remain as CDN URLs for better performance and reliability
   try {
     const parsed = new URL(assetUrl);
+    if (parsed.hostname.includes('googleapis.com') ||
+        parsed.hostname.includes('gstatic.com') ||
+        parsed.hostname.includes('fonts.net') ||
+        parsed.hostname.includes('typekit.net')) {
+      // Mark as "keep original URL" by not adding to downloadedAssets
+      return null;
+    }
+
     const ext = path.extname(parsed.pathname).split("?")[0] || ".bin";
     const localName = `${hashUrl(assetUrl)}${ext}`;
     const localPath = path.join("assets", localName);
@@ -733,6 +744,8 @@ function rewriteAssetUrls(content, currentKey) {
   const currentFile = routeToFilename(currentKey);
   const currentDir = path.dirname(currentFile);
 
+  // Only rewrite URLs that were actually downloaded
+  // Skip CDN URLs (fonts, etc.) that we intentionally preserved
   for (const [originalUrl, localPath] of downloadedAssets) {
     const rel = path.relative(currentDir, localPath).replace(/\\/g, "/");
     result = result.split(originalUrl).join(rel.startsWith(".") ? rel : "./" + rel);
