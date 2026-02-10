@@ -284,6 +284,36 @@ function labelToRouteKey(label) {
   return slug ? `#/${slug}` : null;
 }
 
+// ── Seed sidebar routes (guarantee main nav pages are in the queue) ───────
+
+/**
+ * Extract sidebar/nav item labels from the page and return full URLs for each
+ * derived route. This ensures Colors, Components, Overview, etc. are always
+ * in the crawl queue even if href discovery or click-based capture fails
+ * (e.g. in CI, different viewport, or SPA not updating URL on click).
+ */
+async function seedSidebarRoutesFromPage(page) {
+  const labels = await page.evaluate((selector) => {
+    const elements = document.querySelectorAll(selector);
+    const texts = new Set();
+    elements.forEach((el) => {
+      const t = (el.textContent || "").trim().replace(/\s+/g, " ");
+      if (t.length > 0 && t.length < 100) texts.add(t); // skip huge chunks
+    });
+    return Array.from(texts);
+  }, CLICKABLE_SELECTORS);
+
+  const base = BASE_URL.replace(/\/$/, "");
+  const urls = [];
+  for (const label of labels) {
+    const key = labelToRouteKey(label);
+    if (key) {
+      urls.push(`${base}${key}`);
+    }
+  }
+  return [...new Set(urls)];
+}
+
 // ── Route Discovery (click-based with capture) ─────────────────────────────
 
 /**
@@ -930,18 +960,29 @@ async function main() {
   discoveredRoutes.add(landingKey);
   console.log(`  ✅ Landing: ${landingKey} (fingerprint: ${landingFingerprint.slice(0, 40)}...)\n`);
 
+  // ── Step 1b: Seed queue with sidebar routes from current page ───────────
+  //    Guarantees Colors, Components, Overview, etc. are always crawled
+  //    even if href/click discovery fails (CI, viewport, or SPA not updating URL).
+  const seededUrls = await seedSidebarRoutesFromPage(page);
+  for (const url of seededUrls) {
+    const k = routeKey(url);
+    if (k && !discoveredRoutes.has(k)) {
+      discoveredRoutes.add(k);
+    }
+  }
+  console.log(`  🌱 Seeded ${seededUrls.length} sidebar routes: ${seededUrls.map(u => routeKey(u)).join(", ")}\n`);
+
   // ── Step 2: Discover routes by clicking nav elements & capture ────────
-  //    This is the key improvement: we capture content AT THE MOMENT of
-  //    navigation, rather than trying to replay hash changes later.
   console.log("🔍 Discovering routes via navigation clicks...\n");
   const initialRoutes = await discoverAndCapture(page, context.request, landingKey);
   console.log(`\n  📍 Discovered ${initialRoutes.length} additional route URLs\n`);
 
-  // ── Step 3: Capture any remaining routes not captured via clicks ──────
-  const routeQueue = [...initialRoutes];
+  // ── Step 3: Build queue (seeded + discovered) and capture remaining ────
+  const routeQueue = [...seededUrls, ...initialRoutes];
   for (const r of routeQueue) {
     discoveredRoutes.add(routeKey(r));
   }
+  console.log(`  📋 Queue: ${routeQueue.length} URLs to process\n`);
 
   while (routeQueue.length > 0 && capturedRoutes.size < MAX_PAGES) {
     const url = routeQueue.shift();
