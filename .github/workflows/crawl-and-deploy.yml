@@ -46,7 +46,7 @@ concurrency:
 
 env:
   # For scheduled runs, set your default URL here:
-  DEFAULT_SITE_URL: "https://cabin-hem-65260868.figma.site"
+  DEFAULT_SITE_URL: "https://your-figma-site.com"
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════
@@ -84,6 +84,7 @@ jobs:
           CONCURRENCY: "3"
           PAGE_TIMEOUT: "30000"
           DOWNLOAD_ASSETS: "true"
+          RENDER_DELAY: "3000"
         run: node crawl.js
 
       - name: 📊 Build summary
