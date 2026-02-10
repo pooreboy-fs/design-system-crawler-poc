@@ -223,12 +223,78 @@ const CLICKABLE_SELECTORS = [
   "[class*='ListItem'] a", "[class*='ListItem'] button",
 ].join(", ");
 
+// ── Content fingerprinting ──────────────────────────────────────────────────
+
+/**
+ * Get a quick fingerprint of the page's main content area.
+ * Used to detect when a click changes the visible content even if the URL
+ * doesn't change (common in SPAs that use React state for navigation).
+ *
+ * Compares heading text (h1-h3) — the most reliable signal for whether
+ * the "page" actually changed. Element count alone is too noisy
+ * (sidebar collapse, animations, etc.).
+ */
+async function getContentFingerprint(page) {
+  return await page.evaluate(() => {
+    // Primary signal: heading text in the main content area
+    // Exclude headings in nav/sidebar to avoid false negatives
+    const allHeadings = Array.from(document.querySelectorAll("h1, h2, h3"));
+    const contentHeadings = allHeadings.filter(h => {
+      const parent = h.closest("nav, [class*='sidebar'], [class*='Sidebar'], [role='navigation']");
+      return !parent;
+    });
+    const headingText = contentHeadings
+      .slice(0, 8)
+      .map(h => h.textContent.trim())
+      .join("|");
+
+    // Secondary signal: first few paragraphs
+    const paragraphs = Array.from(document.querySelectorAll("p, [class*='description']"))
+      .slice(0, 3)
+      .map(p => p.textContent.trim().slice(0, 50))
+      .join("|");
+
+    return `${headingText}|||${paragraphs}`;
+  });
+}
+
+/**
+ * Derive a route key from a sidebar button's text label.
+ * e.g., "palette Colors" → "#/colors", "widgets Components" → "#/components"
+ */
+function labelToRouteKey(label) {
+  // Skip known non-navigation labels
+  const skipPatterns = [
+    /collapse/i, /expand/i, /search/i, /close/i, /toggle/i,
+    /menu/i, /hamburger/i, /settings/i,
+  ];
+  if (skipPatterns.some(p => p.test(label))) return null;
+
+  // MUI sidebar items have format: "icon_name LABEL" (e.g., "palette Colors")
+  // Strip the icon prefix — icon names are ALWAYS lowercase with underscores
+  let cleaned = label.replace(/^[a-z_]+\s+/, "").trim();
+  if (!cleaned) cleaned = label.trim();
+  // Convert to slug: "Status Chips" → "status-chips"
+  const slug = cleaned
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return slug ? `#/${slug}` : null;
+}
+
 // ── Route Discovery (click-based with capture) ─────────────────────────────
 
 /**
  * Discover routes AND capture content by clicking navigation elements.
- * This is the key fix: we capture content at the moment of navigation,
- * rather than trying to replay hash changes later.
+ *
+ * Handles TWO types of SPA navigation:
+ *   1. URL changes (hash or path) — detected by comparing URLs
+ *   2. Content-only changes (React state) — detected by content fingerprinting
+ *
+ * For type 2, we derive a route key from the button label since there's
+ * no URL to extract it from.
  *
  * Returns an array of newly discovered route URLs.
  */
@@ -263,26 +329,49 @@ async function discoverAndCapture(page, requestContext, fromKey) {
   }
 
   // 2. Click nav elements: capture content right when we navigate
+  //    Detect BOTH url changes AND content-only changes
   const clickTargets = await page.$$(CLICKABLE_SELECTORS);
   console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable nav elements`);
 
+  // Track labels we've already clicked to avoid duplicates
+  const clickedLabels = new Set();
+
   for (const el of clickTargets) {
     try {
-      // Get the label/text before clicking (for nav map)
+      // Get the label/text before clicking (for nav map + route derivation)
       const labelInfo = await el.evaluate(e => {
         const text = (e.textContent || "").trim().replace(/\s+/g, " ");
         return { text };
       });
 
+      // Skip if we already clicked a button with this label
+      if (clickedLabels.has(labelInfo.text)) continue;
+      clickedLabels.add(labelInfo.text);
+
       const urlBefore = page.url();
+      const contentBefore = await getContentFingerprint(page);
+
       await el.click({ timeout: 2000 }).catch(() => {});
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(1500);
 
       const urlAfter = page.url();
-      if (urlAfter !== urlBefore) {
-        const key = routeKey(urlAfter);
+      const contentAfter = await getContentFingerprint(page);
+
+      const urlChanged = urlAfter !== urlBefore;
+      const contentChanged = contentAfter !== contentBefore;
+
+      if (urlChanged || contentChanged) {
+        // Determine the route key
+        let key;
+        if (urlChanged) {
+          key = routeKey(urlAfter);
+        } else {
+          // URL didn't change — derive key from button label
+          key = labelToRouteKey(labelInfo.text);
+        }
+
         if (key && !capturedRoutes.has(key)) {
-          console.log(`    🔀 Nav click → ${key}`);
+          console.log(`    🔀 Nav click → ${key} (url: ${urlChanged ? "changed" : "same"}, content: ${contentChanged ? "changed" : "same"})`);
 
           // Record in nav map for building sidebar links later
           navMap.set(key, { label: labelInfo.text });
@@ -314,7 +403,7 @@ async function discoverAndCapture(page, requestContext, fromKey) {
 
           capturedRoutes.set(key, {
             key,
-            url: urlAfter,
+            url: urlChanged ? urlAfter : `${BASE_URL}#/${key.replace(/^#\//, "")}`,
             title,
             html,
             css: cssBlocks.join("\n\n"),
@@ -323,7 +412,7 @@ async function discoverAndCapture(page, requestContext, fromKey) {
           discoveredRoutes.add(key);
           console.log(`    ✅ Captured ${key} via click`);
 
-          // Now recursively discover from THIS page too (captures sub-routes)
+          // Discover sub-links from this page
           const subHrefs = await page.evaluate(() => {
             return Array.from(document.querySelectorAll("a[href]")).map(a => {
               return { href: a.href, rawHref: a.getAttribute("href") };
@@ -348,10 +437,22 @@ async function discoverAndCapture(page, requestContext, fromKey) {
         }
 
         // Navigate back so we can click the next element
-        await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(800);
+        if (urlChanged) {
+          await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
+          await page.waitForTimeout(800);
+        } else {
+          // URL didn't change — click the "home" / first nav element to go back
+          // or reload the page to reset state
+          await page.goto(page.url(), {
+            waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
+            timeout: TIMEOUT,
+          });
+          await page.waitForTimeout(RENDER_DELAY);
+        }
       }
-    } catch {}
+    } catch (err) {
+      console.log(`    ⚠️ Click error: ${err.message}`);
+    }
   }
 
   return newRouteUrls;
@@ -361,39 +462,61 @@ async function discoverAndCapture(page, requestContext, fromKey) {
 
 /**
  * Navigate to a specific route and capture the rendered content.
- * Uses a full page reload to ensure React Router initializes with
- * the correct hash route.
+ *
+ * Strategy (in order):
+ *   1. Full page.goto(url) — works when SPA reads hash on load
+ *   2. Click matching sidebar item — works when SPA uses React state nav
+ *   3. Verify content differs from landing page — skip if it's duplicate
  */
 async function captureRoute(page, url, requestContext) {
   const key = routeKey(url);
   if (!key || capturedRoutes.has(key)) return null;
 
+  // Skip the landing page key since it's already captured
+  if (key === "/") return null;
+
   console.log(`  🌐 Capturing: ${key} (${url})`);
 
   try {
-    // ALWAYS do a full page.goto() — this ensures React Router
-    // initializes with the correct hash, rather than trying to
-    // update state after the fact.
+    // Step 1: Full page reload with the hash URL
+    // This works if the SPA reads window.location.hash on initialization
     await page.goto(url, {
       waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
       timeout: TIMEOUT,
     });
     await page.waitForTimeout(RENDER_DELAY);
 
-    // For hash routes, also try clicking the corresponding sidebar element
-    // as a fallback to ensure the content actually renders
+    // Step 2: Check if we got different content than the landing page
+    const fingerprint = await getContentFingerprint(page);
+    const landingRoute = capturedRoutes.get("/");
+    let landingFingerprint = null;
+    if (landingRoute) {
+      // Quick check: does this page look like the landing page?
+      // Compare heading text as a proxy
+      landingFingerprint = landingRoute._fingerprint || null;
+    }
+
+    // Step 3: If content looks like landing page, try clicking sidebar
     const parsedUrl = new URL(url);
-    if (parsedUrl.hash && parsedUrl.hash.length > 1) {
-      const hashPath = parsedUrl.hash.replace(/^#\/?/, "");
-      if (hashPath) {
-        // Try to find and click a matching navigation element
-        await clickMatchingSidebarItem(page, hashPath);
+    const hashPath = (parsedUrl.hash || key).replace(/^#\/?/, "");
+
+    if (hashPath && landingFingerprint && fingerprint === landingFingerprint) {
+      console.log(`    🔄 Hash navigation didn't change content, trying sidebar click for "${hashPath}"...`);
+      const clicked = await clickMatchingSidebarItem(page, hashPath);
+      if (clicked) {
         await page.waitForTimeout(RENDER_DELAY);
       }
     }
 
     // Ensure body has content
     await page.waitForSelector("body *", { timeout: 5000 }).catch(() => {});
+
+    // Final fingerprint check — skip if still duplicate of landing
+    const finalFingerprint = await getContentFingerprint(page);
+    if (landingFingerprint && finalFingerprint === landingFingerprint && key !== "/") {
+      console.log(`    ⏭️  Skipping ${key} — content identical to landing page`);
+      return null;
+    }
 
     // Extract content
     const [html, cssBlocks, assetUrls] = await Promise.all([
@@ -428,6 +551,7 @@ async function captureRoute(page, url, requestContext) {
       html,
       css: cssBlocks.join("\n\n"),
       newRoutes,
+      _fingerprint: finalFingerprint,
     };
 
     capturedRoutes.set(key, result);
@@ -782,6 +906,7 @@ async function main() {
   const landingCss = await extractAllCSS(page);
   const landingTitle = await page.title();
   const landingAssets = await extractAssetUrls(page);
+  const landingFingerprint = await getContentFingerprint(page);
 
   if (DOWNLOAD_ASSETS) {
     for (const u of landingAssets) await downloadAsset(u, context.request);
@@ -800,9 +925,10 @@ async function main() {
     html: landingHtml,
     css: landingCss.join("\n\n"),
     newRoutes: [],
+    _fingerprint: landingFingerprint,
   });
   discoveredRoutes.add(landingKey);
-  console.log(`  ✅ Landing: ${landingKey}\n`);
+  console.log(`  ✅ Landing: ${landingKey} (fingerprint: ${landingFingerprint.slice(0, 40)}...)\n`);
 
   // ── Step 2: Discover routes by clicking nav elements & capture ────────
   //    This is the key improvement: we capture content AT THE MOMENT of
