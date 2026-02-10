@@ -1,0 +1,134 @@
+name: Crawl & Deploy Static Site
+
+on:
+  # ── Manual trigger ────────────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: "URL of the site to crawl"
+        required: true
+        type: string
+      max_pages:
+        description: "Max pages to crawl"
+        required: false
+        default: "50"
+        type: string
+      wait_for_network:
+        description: "Wait for full network idle (slower, more complete)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+  # ── Schedule — uncomment + set your cron ──────────────────────────────
+  # schedule:
+  #   - cron: "0 */4 * * *"    # Every 4 hours
+  #   - cron: "0 8,12,17 * * *" # 8am, noon, 5pm UTC
+  #   - cron: "*/30 * * * *"    # Every 30 minutes
+
+  # ── On push to main (for config changes) ──────────────────────────────
+  # push:
+  #   branches: [main]
+  #   paths: [crawler/**]
+
+# Required for GitHub Pages deployment
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only allow one crawl at a time — cancel any in-progress run
+concurrency:
+  group: "pages-deploy"
+  cancel-in-progress: true
+
+env:
+  # For scheduled runs, set your default URL here:
+  DEFAULT_SITE_URL: "https://your-figma-site.com"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  #  Job 1: Crawl the site
+  # ════════════════════════════════════════════════════════════════════════
+  crawl:
+    name: 🕷️ Crawl Site
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 📦 Install crawler dependencies
+        working-directory: crawler
+        run: npm ci || npm install
+
+      - name: 🎭 Install Playwright Chromium
+        working-directory: crawler
+        run: npx playwright install chromium --with-deps
+
+      - name: 🕷️ Run crawler
+        working-directory: crawler
+        env:
+          SITE_URL: ${{ inputs.site_url || env.DEFAULT_SITE_URL }}
+          OUTPUT_DIR: ./static-output
+          MAX_PAGES: ${{ inputs.max_pages || '50' }}
+          WAIT_FOR_NETWORK: ${{ inputs.wait_for_network || 'true' }}
+          CONCURRENCY: "3"
+          PAGE_TIMEOUT: "30000"
+          DOWNLOAD_ASSETS: "true"
+        run: node crawl.js
+
+      - name: 📊 Build summary
+        working-directory: crawler
+        run: |
+          MANIFEST="./static-output/manifest.json"
+          echo "## 🕷️ Crawl Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "$MANIFEST" ]; then
+            COUNT=$(jq length "$MANIFEST")
+            echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Pages crawled | **$COUNT** |" >> $GITHUB_STEP_SUMMARY
+            echo "| Source | \`${{ inputs.site_url || env.DEFAULT_SITE_URL }}\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| Timestamp | $(date -u '+%Y-%m-%d %H:%M UTC') |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Pages</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "- **\(.title // "Untitled")** → `\(.file)`"' "$MANIFEST" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No manifest — crawl may have failed." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: 📤 Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: crawler/static-output
+
+  # ════════════════════════════════════════════════════════════════════════
+  #  Job 2: Deploy to GitHub Pages
+  # ════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: 🚀 Deploy to GitHub Pages
+    needs: crawl
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: 🚀 Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
