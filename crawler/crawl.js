@@ -9,6 +9,9 @@
  *   2. Clicking all nav/sidebar links and detecting URL changes
  *   3. Following any dynamically discovered routes
  *
+ * Captures content by clicking navigation elements (not just setting hash),
+ * ensuring React Router state updates properly.
+ *
  * Outputs self-contained HTML+CSS pages with no JavaScript.
  */
 
@@ -31,23 +34,26 @@ const RENDER_DELAY = parseInt(process.env.RENDER_DELAY || "3000", 10);
 const capturedRoutes = new Map(); // route key → { url, html, css, title, assets }
 const downloadedAssets = new Map(); // original URL → local path
 const discoveredRoutes = new Set(); // all route keys we've seen
+const navMap = new Map(); // route key → { label, icon } for building navigation
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /**
- * Get a stable key for a route — handles both pathname and hash routing.
+ * Normalize a route key — collapses #/ and / to the same key.
  * Examples:
  *   https://site.com/#/colors     → "#/colors"
  *   https://site.com/about        → "/about"
- *   https://site.com/#/           → "#/"
+ *   https://site.com/#/           → "/"        ← normalized!
  *   https://site.com/             → "/"
  */
 function routeKey(urlStr) {
   try {
     const url = new URL(urlStr);
     if (url.hash && url.hash.length > 1) {
-      // Hash routing: #/colors, #/components, etc.
-      return url.hash;
+      // Normalize #/ to / (they're the same landing page)
+      const hashPath = url.hash.replace(/^#\/?/, "").replace(/\/+$/, "");
+      if (!hashPath) return "/";
+      return "#/" + hashPath;
     }
     // Normal pathname routing
     return url.pathname.replace(/\/+$/, "") || "/";
@@ -60,7 +66,6 @@ function routeKey(urlStr) {
  * Convert a route key to a safe filename
  * "#/colors"     → "colors.html"
  * "#/ai"         → "ai.html"
- * "#/"           → "index.html"
  * "/"            → "index.html"
  * "/about"       → "about.html"
  * "/docs/intro"  → "docs/intro.html"
@@ -199,16 +204,38 @@ async function extractAssetUrls(page) {
   });
 }
 
-// ── Route Discovery ────────────────────────────────────────────────────────
+// ── Clickable element selectors ────────────────────────────────────────────
+
+const CLICKABLE_SELECTORS = [
+  "nav a", "nav button",
+  "[class*='sidebar'] a", "[class*='sidebar'] button",
+  "[class*='Sidebar'] a", "[class*='Sidebar'] button",
+  "[class*='nav'] a", "[class*='nav'] button",
+  "[class*='Nav'] a", "[class*='Nav'] button",
+  "[class*='menu'] a", "[class*='menu'] button",
+  "[class*='Menu'] a", "[class*='Menu'] button",
+  "[role='navigation'] a", "[role='navigation'] button",
+  "[class*='tab'] a", "[class*='tab'] button",
+  "[class*='Tab'] a", "[class*='Tab'] button",
+  // MUI-specific selectors
+  ".MuiListItem-root", ".MuiListItemButton-root",
+  ".MuiTab-root", ".MuiButton-root",
+  "[class*='ListItem'] a", "[class*='ListItem'] button",
+].join(", ");
+
+// ── Route Discovery (click-based with capture) ─────────────────────────────
 
 /**
- * Discovers all routes by scanning hrefs AND clicking navigation elements.
- * Returns an array of full URLs to visit.
+ * Discover routes AND capture content by clicking navigation elements.
+ * This is the key fix: we capture content at the moment of navigation,
+ * rather than trying to replay hash changes later.
+ *
+ * Returns an array of newly discovered route URLs.
  */
-async function discoverAllRoutes(page) {
-  const routes = new Set();
+async function discoverAndCapture(page, requestContext, fromKey) {
+  const newRouteUrls = [];
 
-  // 1. Scan all <a href="..."> including hash links
+  // 1. Scan all <a href="..."> including hash links → just collect URLs
   const hrefs = await page.evaluate(() => {
     return Array.from(document.querySelectorAll("a[href]")).map(a => {
       return { href: a.href, rawHref: a.getAttribute("href") };
@@ -216,75 +243,126 @@ async function discoverAllRoutes(page) {
   });
 
   for (const { href, rawHref } of hrefs) {
-    // Handle hash routes: href="#/colors" or raw "#/colors"
     if (rawHref && rawHref.startsWith("#")) {
       const fullUrl = new URL(BASE_URL);
       fullUrl.hash = rawHref;
       const key = routeKey(fullUrl.href);
-      if (key) routes.add(fullUrl.href);
+      if (key && !discoveredRoutes.has(key) && !capturedRoutes.has(key)) {
+        discoveredRoutes.add(key);
+        newRouteUrls.push(fullUrl.href);
+      }
       continue;
     }
-
-    // Handle normal internal links
     if (href && isInternalUrl(href)) {
       const key = routeKey(href);
-      if (key) routes.add(href);
+      if (key && !discoveredRoutes.has(key) && !capturedRoutes.has(key)) {
+        discoveredRoutes.add(key);
+        newRouteUrls.push(href);
+      }
     }
   }
 
-  // 2. Find clickable nav elements that might trigger route changes
-  //    (React Router Links, sidebar items, nav buttons, etc.)
-  const clickableSelectors = [
-    "nav a", "nav button",
-    "[class*='sidebar'] a", "[class*='sidebar'] button",
-    "[class*='Sidebar'] a", "[class*='Sidebar'] button",
-    "[class*='nav'] a", "[class*='nav'] button",
-    "[class*='Nav'] a", "[class*='Nav'] button",
-    "[class*='menu'] a", "[class*='menu'] button",
-    "[class*='Menu'] a", "[class*='Menu'] button",
-    "[role='navigation'] a", "[role='navigation'] button",
-    "[class*='tab'] a", "[class*='tab'] button",
-    "[class*='Tab'] a", "[class*='Tab'] button",
-    // MUI-specific selectors
-    ".MuiListItem-root", ".MuiListItemButton-root",
-    ".MuiTab-root", ".MuiButton-root",
-    "[class*='ListItem'] a", "[class*='ListItem'] button",
-  ];
-
-  const selector = clickableSelectors.join(", ");
-  const clickTargets = await page.$$(selector);
-
-  console.log(`    📍 Found ${routes.size} href routes + ${clickTargets.length} clickable nav elements`);
+  // 2. Click nav elements: capture content right when we navigate
+  const clickTargets = await page.$$(CLICKABLE_SELECTORS);
+  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable nav elements`);
 
   for (const el of clickTargets) {
     try {
-      const urlBefore = page.url();
+      // Get the label/text before clicking (for nav map)
+      const labelInfo = await el.evaluate(e => {
+        const text = (e.textContent || "").trim().replace(/\s+/g, " ");
+        return { text };
+      });
 
-      // Click and wait for potential navigation
+      const urlBefore = page.url();
       await el.click({ timeout: 2000 }).catch(() => {});
-      await page.waitForTimeout(800);
+      await page.waitForTimeout(1000);
 
       const urlAfter = page.url();
       if (urlAfter !== urlBefore) {
         const key = routeKey(urlAfter);
-        if (key) {
-          routes.add(urlAfter);
+        if (key && !capturedRoutes.has(key)) {
+          console.log(`    🔀 Nav click → ${key}`);
+
+          // Record in nav map for building sidebar links later
+          navMap.set(key, { label: labelInfo.text });
+
+          // Wait for content to fully render
+          await page.waitForTimeout(RENDER_DELAY);
+          await page.waitForSelector("body *", { timeout: 5000 }).catch(() => {});
+
+          // Capture content RIGHT NOW while React has rendered it
+          const [html, cssBlocks, assetUrls] = await Promise.all([
+            extractCleanHTML(page),
+            extractAllCSS(page),
+            extractAssetUrls(page),
+          ]);
+          const title = await page.title();
+
+          if (DOWNLOAD_ASSETS) {
+            for (const assetUrl of assetUrls) {
+              await downloadAsset(assetUrl, requestContext);
+            }
+            for (const cssBlock of cssBlocks) {
+              const urlMatches = cssBlock.match(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g) || [];
+              for (const m of urlMatches) {
+                const u = m.replace(/url\(["']?/, "").replace(/["']?\)/, "");
+                await downloadAsset(u, requestContext);
+              }
+            }
+          }
+
+          capturedRoutes.set(key, {
+            key,
+            url: urlAfter,
+            title,
+            html,
+            css: cssBlocks.join("\n\n"),
+            newRoutes: [],
+          });
+          discoveredRoutes.add(key);
+          console.log(`    ✅ Captured ${key} via click`);
+
+          // Now recursively discover from THIS page too (captures sub-routes)
+          const subHrefs = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll("a[href]")).map(a => {
+              return { href: a.href, rawHref: a.getAttribute("href") };
+            });
+          });
+          for (const { href, rawHref } of subHrefs) {
+            let fullUrl;
+            if (rawHref && rawHref.startsWith("#")) {
+              fullUrl = new URL(BASE_URL);
+              fullUrl.hash = rawHref;
+            } else if (href && isInternalUrl(href)) {
+              fullUrl = new URL(href);
+            }
+            if (fullUrl) {
+              const k = routeKey(fullUrl.href);
+              if (k && !discoveredRoutes.has(k)) {
+                discoveredRoutes.add(k);
+                newRouteUrls.push(fullUrl.href);
+              }
+            }
+          }
         }
+
         // Navigate back so we can click the next element
         await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(500);
+        await page.waitForTimeout(800);
       }
     } catch {}
   }
 
-  return [...routes];
+  return newRouteUrls;
 }
 
-// ── Page Capture ───────────────────────────────────────────────────────────
+// ── Page Capture (for routes not captured via click) ────────────────────────
 
 /**
- * Navigate to a specific route (handles both hash and pathname routing)
- * and capture the rendered content.
+ * Navigate to a specific route and capture the rendered content.
+ * Uses a full page reload to ensure React Router initializes with
+ * the correct hash route.
  */
 async function captureRoute(page, url, requestContext) {
   const key = routeKey(url);
@@ -293,33 +371,25 @@ async function captureRoute(page, url, requestContext) {
   console.log(`  🌐 Capturing: ${key} (${url})`);
 
   try {
-    // For hash routes, go to base URL first then set hash
+    // ALWAYS do a full page.goto() — this ensures React Router
+    // initializes with the correct hash, rather than trying to
+    // update state after the fact.
+    await page.goto(url, {
+      waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
+      timeout: TIMEOUT,
+    });
+    await page.waitForTimeout(RENDER_DELAY);
+
+    // For hash routes, also try clicking the corresponding sidebar element
+    // as a fallback to ensure the content actually renders
     const parsedUrl = new URL(url);
     if (parsedUrl.hash && parsedUrl.hash.length > 1) {
-      // Navigate to base URL if not already there
-      const currentBase = page.url().split("#")[0];
-      const targetBase = url.split("#")[0];
-      if (currentBase !== targetBase) {
-        await page.goto(targetBase, {
-          waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-          timeout: TIMEOUT,
-        });
-        await page.waitForTimeout(1500);
+      const hashPath = parsedUrl.hash.replace(/^#\/?/, "");
+      if (hashPath) {
+        // Try to find and click a matching navigation element
+        await clickMatchingSidebarItem(page, hashPath);
+        await page.waitForTimeout(RENDER_DELAY);
       }
-
-      // Set the hash to trigger React Router navigation
-      await page.evaluate((hash) => {
-        window.location.hash = hash;
-      }, parsedUrl.hash);
-
-      // Wait for content to render
-      await page.waitForTimeout(RENDER_DELAY);
-    } else {
-      await page.goto(url, {
-        waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-        timeout: TIMEOUT,
-      });
-      await page.waitForTimeout(RENDER_DELAY);
     }
 
     // Ensure body has content
@@ -348,8 +418,8 @@ async function captureRoute(page, url, requestContext) {
       }
     }
 
-    // Discover additional routes from this page
-    const newRoutes = await discoverAllRoutes(page);
+    // Discover additional routes (href-only, don't click here)
+    const newRoutes = await discoverHrefRoutes(page);
 
     const result = {
       key,
@@ -368,6 +438,61 @@ async function captureRoute(page, url, requestContext) {
   }
 }
 
+/**
+ * Try to click a sidebar element that matches the given route path.
+ * This triggers React Router's internal navigation properly.
+ */
+async function clickMatchingSidebarItem(page, hashPath) {
+  const segments = hashPath.split("/");
+  const lastSegment = segments[segments.length - 1] || "";
+  const searchTerms = [
+    lastSegment.replace(/-/g, " "),
+    lastSegment,
+    hashPath,
+  ].filter(Boolean);
+
+  for (const term of searchTerms) {
+    try {
+      const buttons = await page.$$(CLICKABLE_SELECTORS);
+      for (const btn of buttons) {
+        const text = await btn.evaluate(e => (e.textContent || "").trim().toLowerCase());
+        if (text.includes(term.toLowerCase())) {
+          await btn.click({ timeout: 2000 }).catch(() => {});
+          return true;
+        }
+      }
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Discover routes from <a href> only (no clicking), for use during capture.
+ */
+async function discoverHrefRoutes(page) {
+  const routes = [];
+  const hrefs = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll("a[href]")).map(a => {
+      return { href: a.href, rawHref: a.getAttribute("href") };
+    });
+  });
+
+  for (const { href, rawHref } of hrefs) {
+    if (rawHref && rawHref.startsWith("#")) {
+      const fullUrl = new URL(BASE_URL);
+      fullUrl.hash = rawHref;
+      const key = routeKey(fullUrl.href);
+      if (key) routes.push(fullUrl.href);
+      continue;
+    }
+    if (href && isInternalUrl(href)) {
+      const key = routeKey(href);
+      if (key) routes.push(href);
+    }
+  }
+  return routes;
+}
+
 // ── Link Rewriting ─────────────────────────────────────────────────────────
 
 /**
@@ -381,7 +506,7 @@ function rewriteLinks(html, currentKey) {
 
   for (const [key] of capturedRoutes) {
     const targetFile = routeToFilename(key);
-    let rel = path.relative(currentDir, targetFile);
+    let rel = path.relative(currentDir, targetFile).replace(/\\/g, "/");
     if (!rel.startsWith(".")) rel = "./" + rel;
 
     // Rewrite hash-style hrefs: href="#/colors" etc.
@@ -416,11 +541,175 @@ function rewriteAssetUrls(content, currentKey) {
   const currentDir = path.dirname(currentFile);
 
   for (const [originalUrl, localPath] of downloadedAssets) {
-    const rel = path.relative(currentDir, localPath);
+    const rel = path.relative(currentDir, localPath).replace(/\\/g, "/");
     result = result.split(originalUrl).join(rel.startsWith(".") ? rel : "./" + rel);
   }
   return result;
 }
+
+// ── Navigation Injection ──────────────────────────────────────────────────
+
+/**
+ * Build a static navigation bar HTML that links to all captured pages.
+ * This replaces the dead JavaScript-driven sidebar buttons.
+ */
+function buildNavBar(currentKey) {
+  // Group routes into sections
+  const mainRoutes = []; // top-level routes like #/colors, #/overview
+  const aiRoutes = [];   // #/ai/* routes
+  const componentRoutes = [];  // #/components/* and #/ai/components/*
+
+  for (const [key] of capturedRoutes) {
+    const filename = routeToFilename(key);
+    if (filename === "index.html" && key === "/") continue; // skip duplicate
+
+    if (key.startsWith("#/ai/components/") || key.startsWith("#/components/")) {
+      componentRoutes.push(key);
+    } else if (key.startsWith("#/ai")) {
+      aiRoutes.push(key);
+    } else {
+      mainRoutes.push(key);
+    }
+  }
+
+  function makeLink(key, label) {
+    const currentFile = routeToFilename(currentKey);
+    const currentDir = path.dirname(currentFile);
+    const targetFile = routeToFilename(key);
+    let rel = path.relative(currentDir, targetFile).replace(/\\/g, "/");
+    if (!rel.startsWith(".")) rel = "./" + rel;
+    const isActive = key === currentKey;
+    const activeClass = isActive ? ' class="nav-active"' : '';
+    return `<a href="${rel}"${activeClass}>${label}</a>`;
+  }
+
+  function keyToLabel(key) {
+    // Use navMap label if available, otherwise derive from key
+    if (navMap.has(key)) {
+      const raw = navMap.get(key).label;
+      // Clean up MUI icon text (e.g., "palette Colors" → "Colors")
+      // Icon text is typically a single lowercase word followed by the label
+      const cleaned = raw.replace(/^[a-z_]+\s+/, "");
+      return cleaned || raw;
+    }
+    const cleaned = key
+      .replace(/^#\//, "")
+      .replace(/^\//, "")
+      .split("/").pop()
+      .replace(/-/g, " ");
+    return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+  }
+
+  let nav = `<nav class="static-nav" aria-label="Page navigation">\n`;
+  nav += `  <div class="static-nav-brand">Site Navigation</div>\n`;
+  nav += `  <div class="static-nav-section">\n`;
+
+  // Home link
+  if (capturedRoutes.has("/")) {
+    nav += `    ${makeLink("/", "Home")}\n`;
+  }
+
+  // Main section pages
+  for (const key of mainRoutes.sort()) {
+    if (key === "/") continue;
+    nav += `    ${makeLink(key, keyToLabel(key))}\n`;
+  }
+
+  // AI section
+  if (aiRoutes.length > 0) {
+    nav += `  </div>\n  <div class="static-nav-section">\n`;
+    nav += `    <div class="static-nav-heading">AI Snapshot</div>\n`;
+    for (const key of aiRoutes.sort()) {
+      nav += `    ${makeLink(key, keyToLabel(key))}\n`;
+    }
+  }
+
+  // Components
+  if (componentRoutes.length > 0) {
+    nav += `  </div>\n  <div class="static-nav-section">\n`;
+    nav += `    <div class="static-nav-heading">Components</div>\n`;
+    for (const key of componentRoutes.sort()) {
+      nav += `    ${makeLink(key, keyToLabel(key))}\n`;
+    }
+  }
+
+  nav += `  </div>\n</nav>`;
+  return nav;
+}
+
+const NAV_CSS = `
+/* ── Static Navigation (injected by crawler) ──────────────────────────── */
+.static-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 220px;
+  height: 100vh;
+  overflow-y: auto;
+  background: #1a1f36;
+  color: #c1c7d7;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+  z-index: 99999;
+  padding: 0;
+  box-shadow: 2px 0 8px rgba(0,0,0,0.15);
+}
+.static-nav-brand {
+  padding: 16px 16px 12px;
+  font-weight: 700;
+  font-size: 14px;
+  color: #fff;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+  margin-bottom: 8px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.static-nav-section {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.static-nav-heading {
+  padding: 10px 16px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #8a8fa8;
+}
+.static-nav a {
+  display: block;
+  padding: 7px 16px 7px 20px;
+  color: #c1c7d7;
+  text-decoration: none;
+  transition: background 0.15s, color 0.15s;
+  border-left: 3px solid transparent;
+}
+.static-nav a:hover {
+  background: rgba(255,255,255,0.07);
+  color: #fff;
+}
+.static-nav a.nav-active {
+  background: rgba(255,255,255,0.1);
+  color: #7ef29d;
+  border-left-color: #7ef29d;
+  font-weight: 600;
+}
+/* Push main content to the right of the nav */
+body {
+  margin-left: 220px !important;
+}
+@media (max-width: 768px) {
+  .static-nav {
+    position: relative;
+    width: 100%;
+    height: auto;
+    max-height: 50vh;
+  }
+  body {
+    margin-left: 0 !important;
+  }
+}
+`;
 
 // ── Output Building ────────────────────────────────────────────────────────
 
@@ -433,6 +722,8 @@ function buildPage(route) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
+  const navHtml = buildNavBar(route.key);
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -441,9 +732,11 @@ function buildPage(route) {
   <title>${safeTitle}</title>
   <style>
 ${css}
+${NAV_CSS}
   </style>
 </head>
 <body>
+${navHtml}
 ${html}
 </body>
 </html>`;
@@ -474,7 +767,7 @@ async function main() {
 
   const page = await context.newPage();
 
-  // ── Step 1: Load the site and discover initial routes ────────────────
+  // ── Step 1: Load the site and capture landing page ────────────────────
   console.log("📡 Loading site and discovering routes...\n");
 
   await page.goto(BASE_URL, {
@@ -511,17 +804,19 @@ async function main() {
   discoveredRoutes.add(landingKey);
   console.log(`  ✅ Landing: ${landingKey}\n`);
 
-  // Discover routes from the landing page
-  const initialRoutes = await discoverAllRoutes(page);
-  console.log(`\n  📍 Discovered ${initialRoutes.length} initial routes\n`);
+  // ── Step 2: Discover routes by clicking nav elements & capture ────────
+  //    This is the key improvement: we capture content AT THE MOMENT of
+  //    navigation, rather than trying to replay hash changes later.
+  console.log("🔍 Discovering routes via navigation clicks...\n");
+  const initialRoutes = await discoverAndCapture(page, context.request, landingKey);
+  console.log(`\n  📍 Discovered ${initialRoutes.length} additional route URLs\n`);
 
-  // Add to queue
+  // ── Step 3: Capture any remaining routes not captured via clicks ──────
   const routeQueue = [...initialRoutes];
   for (const r of routeQueue) {
     discoveredRoutes.add(routeKey(r));
   }
 
-  // ── Step 2: Crawl all discovered routes ──────────────────────────────
   while (routeQueue.length > 0 && capturedRoutes.size < MAX_PAGES) {
     const url = routeQueue.shift();
     const key = routeKey(url);
@@ -539,19 +834,40 @@ async function main() {
         }
       }
     }
+
+    // After capturing a page, try discovering more routes via clicks
+    // (only if this is a page with potential navigation)
+    if (result) {
+      const moreRoutes = await discoverAndCapture(page, context.request, key);
+      for (const newUrl of moreRoutes) {
+        const newKey = routeKey(newUrl);
+        if (newKey && !discoveredRoutes.has(newKey)) {
+          discoveredRoutes.add(newKey);
+          routeQueue.push(newUrl);
+        }
+      }
+    }
   }
 
   await browser.close();
 
-  // ── Step 3: Write static files ───────────────────────────────────────
+  // ── Step 4: Write static files ───────────────────────────────────────
   console.log(`\n📝 Writing ${capturedRoutes.size} static pages...\n`);
 
   const manifest = [];
+  const writtenFiles = new Set();
 
   for (const [key, route] of capturedRoutes) {
     const filename = routeToFilename(key);
-    const fullPath = path.join(OUTPUT_DIR, filename);
 
+    // Avoid writing the same file twice (e.g., / and #/ both → index.html)
+    if (writtenFiles.has(filename)) {
+      console.log(`  ⏭️  Skipping duplicate: ${filename} (${key})`);
+      continue;
+    }
+    writtenFiles.add(filename);
+
+    const fullPath = path.join(OUTPUT_DIR, filename);
     const staticHTML = buildPage(route);
 
     await fs.ensureDir(path.dirname(fullPath));
