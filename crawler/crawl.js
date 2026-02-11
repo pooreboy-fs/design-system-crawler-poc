@@ -233,6 +233,9 @@ const CLICKABLE_SELECTORS = [
   ".MuiListItem-root", ".MuiListItemButton-root",
   ".MuiTab-root", ".MuiButton-root",
   "[class*='ListItem'] a", "[class*='ListItem'] button",
+  // Figma Make component cards and clickable elements
+  "[data-slot='card'][class*='cursor-pointer']",
+  "[class*='cursor-pointer'][role='button']",
   // Generic button/link selectors (for Figma sites with generic Tailwind classes)
   "button", "a[href]",
 ].join(", ");
@@ -416,11 +419,28 @@ async function discoverAndCapture(page, requestContext, fromKey) {
     'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
     'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
   ];
+
+  // Check if we're on a components-related page to be more permissive
+  const currentUrl = page.url();
+  const isComponentsPage = currentUrl.includes('components') || currentUrl.includes('#/components');
+
   const clickTargets = [];
   for (const el of allClickTargets) {
     const text = await el.evaluate(e => (e.textContent || "").trim());
     const lowerText = text.toLowerCase();
-    // Include if: has nav keyword, or is short and single-word/phrase (< 30 chars)
+
+    // On components page, be more aggressive - click anything with cursor-pointer or data-slot="card"
+    if (isComponentsPage) {
+      const isClickableCard = await el.evaluate(e => {
+        return e.hasAttribute('data-slot') || e.classList.contains('cursor-pointer') || e.getAttribute('role') === 'button';
+      });
+      if (isClickableCard && text.length > 0 && text.length < 100) {
+        clickTargets.push(el);
+        continue;
+      }
+    }
+
+    // Standard filtering: has nav keyword, or is short (< 30 chars)
     if (navKeywords.some(kw => lowerText.includes(kw)) || (text.length > 0 && text.length < 30 && !lowerText.includes('collapse') && !lowerText.includes('view ai'))) {
       clickTargets.push(el);
     }
@@ -434,10 +454,16 @@ async function discoverAndCapture(page, requestContext, fromKey) {
   for (const el of clickTargets) {
     try {
       // Get the label/text before clicking (for nav map + route derivation)
-      const labelInfo = await el.evaluate(e => {
-        const text = (e.textContent || "").trim().replace(/\s+/g, " ");
-        return { text };
-      });
+      let labelInfo;
+      try {
+        labelInfo = await el.evaluate(e => {
+          const text = (e.textContent || "").trim().replace(/\s+/g, " ");
+          return { text };
+        });
+      } catch (err) {
+        console.log(`    ⚠️ Click error: ${err.message}`);
+        continue;
+      }
 
       // Skip if we already clicked a button with this label
       if (clickedLabels.has(labelInfo.text)) continue;
@@ -446,11 +472,34 @@ async function discoverAndCapture(page, requestContext, fromKey) {
       const urlBefore = page.url();
       const contentBefore = await getContentFingerprint(page);
 
-      await el.click({ timeout: 2000 }).catch(() => {});
+      // Try clicking with better error handling
+      let clickSucceeded = false;
+      try {
+        await el.click({ timeout: 2000, force: true });
+        clickSucceeded = true;
+      } catch (err) {
+        // If execution context was destroyed, the navigation might have happened anyway
+        if (!err.message.includes('Execution context was destroyed')) {
+          console.log(`    ⚠️ Click error: ${err.message}`);
+          continue;
+        }
+        // Continue anyway - navigation may have occurred
+        clickSucceeded = true;
+      }
+
+      if (!clickSucceeded) continue;
+
       await page.waitForTimeout(1500);
 
-      const urlAfter = page.url();
-      const contentAfter = await getContentFingerprint(page);
+      let urlAfter, contentAfter;
+      try {
+        urlAfter = page.url();
+        contentAfter = await getContentFingerprint(page);
+      } catch (err) {
+        // Page might have navigated, skip this element
+        console.log(`    ⚠️ Navigation error after click: ${err.message}`);
+        continue;
+      }
 
       const urlChanged = urlAfter !== urlBefore;
       const contentChanged = contentAfter !== contentBefore;
@@ -638,6 +687,11 @@ async function captureRoute(page, url, requestContext) {
 
     // Discover additional routes (href-only, don't click here)
     const newRoutes = await discoverHrefRoutes(page);
+
+    // Also discover routes by clicking (for SPAs with content-only changes)
+    // This is especially important for components pages with clickable cards
+    const clickDiscoveredRoutes = await discoverAndCapture(page, requestContext, key);
+    newRoutes.push(...clickDiscoveredRoutes);
 
     const result = {
       key,
