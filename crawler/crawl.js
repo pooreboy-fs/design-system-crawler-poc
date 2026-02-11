@@ -323,7 +323,15 @@ async function seedSidebarRoutesFromPage(page) {
   const labels = await page.evaluate((selector) => {
     const elements = document.querySelectorAll(selector);
     const texts = new Set();
-    const navKeywords = ['overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation', 'home', 'about', 'docs'];
+    const navKeywords = [
+      'overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation',
+      'home', 'about', 'docs',
+      // Component keywords for discovering sub-pages
+      'button', 'card', 'chip', 'input', 'select', 'modal', 'dialog', 'tooltip', 'dropdown',
+      'menu', 'table', 'form', 'checkbox', 'radio', 'switch', 'slider', 'badge', 'avatar',
+      'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
+      'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
+    ];
 
     elements.forEach((el) => {
       const t = (el.textContent || "").trim().replace(/\s+/g, " ");
@@ -399,7 +407,15 @@ async function discoverAndCapture(page, requestContext, fromKey) {
   const allClickTargets = await page.$$(CLICKABLE_SELECTORS);
 
   // Filter to only navigation-looking elements
-  const navKeywords = ['overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation', 'home', 'about', 'docs', 'guide', 'api', 'settings'];
+  const navKeywords = [
+    'overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation',
+    'home', 'about', 'docs', 'guide', 'api', 'settings',
+    // Component keywords for sub-page discovery
+    'button', 'card', 'chip', 'input', 'select', 'modal', 'dialog', 'tooltip', 'dropdown',
+    'menu', 'table', 'form', 'checkbox', 'radio', 'switch', 'slider', 'badge', 'avatar',
+    'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
+    'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
+  ];
   const clickTargets = [];
   for (const el of allClickTargets) {
     const text = await el.evaluate(e => (e.textContent || "").trim());
