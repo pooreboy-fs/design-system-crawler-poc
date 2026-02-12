@@ -236,6 +236,10 @@ const CLICKABLE_SELECTORS = [
   // Figma Make component cards and clickable elements
   "[data-slot='card'][class*='cursor-pointer']",
   "[class*='cursor-pointer'][role='button']",
+  // Component listing page: links to component detail pages (Button, Tab, Badge, etc.)
+  "a[href*='#/components/']", "a[href*='/components/']",
+  "[class*='card'] a", "[class*='Card'] a",
+  "[class*='card']", "[class*='Card']",
   // Generic button/link selectors (for Figma sites with generic Tailwind classes)
   "button", "a[href]",
 ].join(", ");
@@ -312,6 +316,28 @@ function labelToRouteKey(label) {
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
   return slug ? `#/${slug}` : null;
+}
+
+/**
+ * When on the components listing page, derive component detail route from label.
+ * "Button", "Button Complete", "Tab Complete" → "#/components/button", "#/components/tab"
+ */
+function labelToComponentDetailRouteKey(label) {
+  if (!label || typeof label !== "string") return null;
+  // Strip "Complete" badge and similar status text
+  let cleaned = label
+    .replace(/\s*Complete\s*/gi, " ")
+    .replace(/\s*Beta\s*/gi, " ")
+    .replace(/\s*New\s*/gi, " ")
+    .trim();
+  if (!cleaned) return null;
+  const slug = cleaned
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return slug ? `#/components/${slug}` : null;
 }
 
 // ── Seed sidebar routes (guarantee main nav pages are in the queue) ───────
@@ -420,21 +446,39 @@ async function discoverAndCapture(page, requestContext, fromKey) {
     'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
   ];
 
-  // Check if we're on a components-related page to be more permissive
+  // Check if we're on the components listing page (so we crawl Button, Tab, Badge, etc.)
   const currentUrl = page.url();
-  const isComponentsPage = currentUrl.includes('components') || currentUrl.includes('#/components');
+  const isComponentsListingPage = /#\/components\/?$|\/components\/?$/.test(routeKey(currentUrl) || "");
 
   const clickTargets = [];
   for (const el of allClickTargets) {
-    const text = await el.evaluate(e => (e.textContent || "").trim());
+    const text = await el.evaluate(e => (e.textContent || "").trim().replace(/\s+/g, " "));
     const lowerText = text.toLowerCase();
 
-    // On components page, be more aggressive - click anything with cursor-pointer or data-slot="card"
-    if (isComponentsPage) {
-      const isClickableCard = await el.evaluate(e => {
-        return e.hasAttribute('data-slot') || e.classList.contains('cursor-pointer') || e.getAttribute('role') === 'button';
+    // On components listing page: click every link/card that leads to a component detail page
+    if (isComponentsListingPage) {
+      const isComponentDetailLink = await el.evaluate(e => {
+        if (e.tagName === "A") {
+          const href = (e.getAttribute("href") || "").trim();
+          return href.includes("/components/") && href !== "#/components" && href !== "/components";
+        }
+        return false;
       });
-      if (isClickableCard && text.length > 0 && text.length < 100) {
+      const looksLikeComponentCard = await el.evaluate(e => {
+        const hasCardClass = /card|Card/.test(e.className || "");
+        const hasPointer = e.classList.contains("cursor-pointer") || e.getAttribute("role") === "button";
+        const hasDataSlot = e.hasAttribute("data-slot");
+        const href = e.closest("a")?.getAttribute("href") || e.getAttribute("href") || "";
+        const isComponentHref = href.includes("/components/") && href !== "#/components" && href !== "/components";
+        return hasCardClass || hasPointer || hasDataSlot || isComponentHref;
+      });
+      const componentSlug = labelToComponentDetailRouteKey(text);
+      if ((isComponentDetailLink || (looksLikeComponentCard && componentSlug)) && text.length > 0 && text.length < 120) {
+        clickTargets.push(el);
+        continue;
+      }
+      // Also include any short label that looks like a component name (Button, Tab, Badge, etc.)
+      if (componentSlug && text.length > 0 && text.length < 80) {
         clickTargets.push(el);
         continue;
       }
@@ -448,7 +492,7 @@ async function discoverAndCapture(page, requestContext, fromKey) {
 
   console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable nav elements (filtered from ${allClickTargets.length})`);
 
-  // Track labels we've already clicked to avoid duplicates
+  // Track labels we've already clicked to avoid duplicates (use normalized key on components page)
   const clickedLabels = new Set();
 
   for (const el of clickTargets) {
@@ -465,9 +509,12 @@ async function discoverAndCapture(page, requestContext, fromKey) {
         continue;
       }
 
-      // Skip if we already clicked a button with this label
-      if (clickedLabels.has(labelInfo.text)) continue;
-      clickedLabels.add(labelInfo.text);
+      // Dedupe: on components page use normalized component key (Button Complete === Button)
+      const dedupeKey = isComponentsListingPage && labelToComponentDetailRouteKey(labelInfo.text)
+        ? labelToComponentDetailRouteKey(labelInfo.text)
+        : labelInfo.text;
+      if (clickedLabels.has(dedupeKey)) continue;
+      clickedLabels.add(dedupeKey);
 
       const urlBefore = page.url();
       const contentBefore = await getContentFingerprint(page);
@@ -511,7 +558,15 @@ async function discoverAndCapture(page, requestContext, fromKey) {
           key = routeKey(urlAfter);
         } else {
           // URL didn't change — derive key from button label
-          key = labelToRouteKey(labelInfo.text);
+          // On components listing page, derive #/components/button from "Button" / "Button Complete"
+          const isFromComponentsListing = fromKey && (
+            fromKey === "#/components" || fromKey === "/components"
+          );
+          if (isFromComponentsListing) {
+            key = labelToComponentDetailRouteKey(labelInfo.text) || labelToRouteKey(labelInfo.text);
+          } else {
+            key = labelToRouteKey(labelInfo.text);
+          }
         }
 
         if (key && !capturedRoutes.has(key)) {

@@ -46,7 +46,7 @@ concurrency:
 
 env:
   # For scheduled runs, set your default URL here:
-  DEFAULT_SITE_URL: "https://your-figma-site.com"
+  DEFAULT_SITE_URL: "https://cabin-hem-65260868.figma.site/"
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════
