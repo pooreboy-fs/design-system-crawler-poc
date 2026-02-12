@@ -407,7 +407,18 @@ const SIDEBAR_SELECTOR = "nav, [class*='sidebar'], [class*='Sidebar'], [role='na
  */
 async function seedSidebarRoutesFromPage(page) {
   const items = await page.evaluate(({ clickableSelector, sidebarSelector }) => {
-    const sidebar = document.querySelector(sidebarSelector);
+    const candidates = document.querySelectorAll(sidebarSelector);
+    let sidebar = null;
+    let maxLinks = 0;
+    candidates.forEach((cand) => {
+      const hashLinks = cand.querySelectorAll('a[href^="#"]');
+      const pathLinks = cand.querySelectorAll('a[href^="/"]');
+      const count = hashLinks.length + pathLinks.length;
+      if (count > maxLinks) {
+        maxLinks = count;
+        sidebar = cand;
+      }
+    });
     if (!sidebar) return [];
     const elements = sidebar.querySelectorAll(clickableSelector);
     const seen = new Set();
@@ -419,6 +430,7 @@ async function seedSidebarRoutesFromPage(page) {
     elements.forEach((el) => {
       const t = (el.textContent || "").trim().replace(/\s+/g, " ");
       if (t.length === 0 || t.length > 80) return;
+      if (!el.matches("a[href]") && t.length > 50) return;
       const lower = t.toLowerCase();
       const hasNavKeyword = navKeywords.some(kw => lower.includes(kw));
       const isShort = t.length < 50 && !t.includes("  ");
@@ -458,6 +470,38 @@ async function seedSidebarRoutesFromPage(page) {
       byKey.set(key, { url: `${base}${key}`, label: cleanLabelForBreadcrumb(label) });
     }
   }
+
+  if (byKey.size <= 1) {
+    const fallbackLinks = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('a[href^="#"]').forEach((a) => {
+        const href = a.getAttribute("href");
+        const label = (a.textContent || "").trim().replace(/\s+/g, " ");
+        if (href && href.length > 1) out.push({ href, label: label.slice(0, 80), isPath: false });
+      });
+      document.querySelectorAll('a[href^="/"]').forEach((a) => {
+        const href = a.getAttribute("href");
+        const label = (a.textContent || "").trim().replace(/\s+/g, " ");
+        if (href && !href.startsWith("//")) out.push({ href, label: label.slice(0, 80), isPath: true });
+      });
+      return out;
+    });
+    for (const { href, label, isPath } of fallbackLinks) {
+      let key = null;
+      if (href.startsWith("#")) {
+        const u = new URL(base);
+        u.hash = href;
+        key = routeKey(u.href);
+      } else if (isPath && href.startsWith("/")) {
+        key = routeKey(new URL(href, base).href);
+      }
+      if (key && !byKey.has(key)) {
+        const displayLabel = label && label.length > 0 ? cleanLabelForBreadcrumb(label) : keyToDefaultLabel(key);
+        byKey.set(key, { url: `${base}${key}`, label: displayLabel });
+      }
+    }
+  }
+
   return Array.from(byKey.entries()).map(([k, v]) => ({ key: k, url: v.url, label: v.label }));
 }
 
