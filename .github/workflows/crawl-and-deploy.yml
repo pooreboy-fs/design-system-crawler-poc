@@ -7,6 +7,7 @@ on:
       site_url:
         description: "URL of the site to crawl"
         required: true
+        default: "https://cabin-hem-65260868.figma.site/"
         type: string
       max_pages:
         description: "Max pages to crawl"
