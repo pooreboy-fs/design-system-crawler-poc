@@ -406,7 +406,7 @@ const SIDEBAR_SELECTOR = "nav, [class*='sidebar'], [class*='Sidebar'], [role='na
  * and use these as the only seed — everything else is discovered by crawling down.
  */
 async function seedSidebarRoutesFromPage(page) {
-  const items = await page.evaluate((clickableSelector, sidebarSelector) => {
+  const items = await page.evaluate(({ clickableSelector, sidebarSelector }) => {
     const sidebar = document.querySelector(sidebarSelector);
     if (!sidebar) return [];
     const elements = sidebar.querySelectorAll(clickableSelector);
@@ -435,7 +435,7 @@ async function seedSidebarRoutesFromPage(page) {
       results.push({ label: t, href });
     });
     return results;
-  }, CLICKABLE_SELECTORS, SIDEBAR_SELECTOR);
+  }, { clickableSelector: CLICKABLE_SELECTORS, sidebarSelector: SIDEBAR_SELECTOR });
 
   const base = BASE_URL.replace(/\/$/, "");
   const byKey = new Map();
