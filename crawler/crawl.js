@@ -340,51 +340,125 @@ function labelToComponentDetailRouteKey(label) {
   return slug ? `#/components/${slug}` : null;
 }
 
-// ── Seed sidebar routes (guarantee main nav pages are in the queue) ───────
+/**
+ * Get slug from a button/label for content-only route derivation.
+ * "Button", "Tab 1" → "button", "tab-1"
+ */
+function labelToSlug(label) {
+  if (!label || typeof label !== "string") return null;
+  const k = labelToRouteKey(label);
+  if (!k) return null;
+  return k.replace(/^#\/?|\/$/g, "") || null;
+}
 
 /**
- * Extract sidebar/nav item labels from the page and return full URLs for each
- * derived route. This ensures Colors, Components, Overview, etc. are always
- * in the crawl queue even if href discovery or click-based capture fails
- * (e.g. in CI, different viewport, or SPA not updating URL on click).
+ * Derive route key when URL didn't change but content did (e.g. click opened a panel/tab).
+ * Puts the new "page" under the current route: fromKey "#/overview" + "Usage" → "#/overview/usage"
+ */
+function deriveContentRouteKey(fromKey, label) {
+  const slug = labelToSlug(label);
+  if (!slug) return null;
+  const base = (fromKey || "/").replace(/\/+$/, "").trim();
+  const prefix = base.startsWith("#") ? "#/" : "/";
+  const path = base.replace(/^#\/?|\/+$/g, "") || "";
+  if (!path) return prefix + slug;
+  return prefix + path + "/" + slug;
+}
+
+/**
+ * Clean button/link text for use in breadcrumb (strip "Complete", icon prefix, etc.).
+ */
+function cleanLabelForBreadcrumb(label) {
+  if (!label || typeof label !== "string") return "";
+  let cleaned = label
+    .replace(/\s*Complete\s*/gi, " ")
+    .replace(/\s*Beta\s*/gi, " ")
+    .replace(/\s*New\s*/gi, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+  // Strip leading icon word (e.g. "palette Colors" → "Colors")
+  cleaned = cleaned.replace(/^[a-z_]+\s+/, "").trim();
+  return cleaned || label.trim();
+}
+
+/**
+ * Derive a default breadcrumb label from a route key when we don't have one from a click.
+ * "#/components/badge" → "Components/Badge", "#/colors" → "Colors"
+ */
+function keyToDefaultLabel(key) {
+  if (!key || key === "/") return "Overview";
+  const path = key.replace(/^#\/?|\/+$/g, "").trim();
+  if (!path) return "Overview";
+  const segments = path.split("/").filter(Boolean);
+  return segments
+    .map(seg => seg.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase()))
+    .join("/");
+}
+
+// ── Seed sidebar routes (guarantee main nav pages are in the queue) ───────
+
+// Selector for sidebar container (base pages only)
+const SIDEBAR_SELECTOR = "nav, [class*='sidebar'], [class*='Sidebar'], [role='navigation']";
+
+/**
+ * Extract base page links from the sidebar only. Returns { key, url, label } for each
+ * so we can set breadcrumbs (Overview, Colors, Typography, Components, etc.)
+ * and use these as the only seed — everything else is discovered by crawling down.
  */
 async function seedSidebarRoutesFromPage(page) {
-  const labels = await page.evaluate((selector) => {
-    const elements = document.querySelectorAll(selector);
-    const texts = new Set();
+  const items = await page.evaluate((clickableSelector, sidebarSelector) => {
+    const sidebar = document.querySelector(sidebarSelector);
+    if (!sidebar) return [];
+    const elements = sidebar.querySelectorAll(clickableSelector);
+    const seen = new Set();
+    const results = [];
     const navKeywords = [
-      'overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation',
-      'home', 'about', 'docs',
-      // Component keywords for discovering sub-pages
-      'button', 'card', 'chip', 'input', 'select', 'modal', 'dialog', 'tooltip', 'dropdown',
-      'menu', 'table', 'form', 'checkbox', 'radio', 'switch', 'slider', 'badge', 'avatar',
-      'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
-      'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
+      "overview", "colors", "typography", "spacing", "components", "iconography", "navigation",
+      "home", "about", "docs", "guide", "api"
     ];
-
     elements.forEach((el) => {
       const t = (el.textContent || "").trim().replace(/\s+/g, " ");
-      // Filter: only include if it contains navigation keywords or is short (likely a nav label)
-      if (t.length > 0 && t.length < 100) {
-        const hasNavKeyword = navKeywords.some(kw => t.toLowerCase().includes(kw));
-        const isShortLabel = t.length < 50 && !t.includes('  '); // likely a navigation label
-        if (hasNavKeyword || isShortLabel) {
-          texts.add(t);
-        }
+      if (t.length === 0 || t.length > 80) return;
+      const lower = t.toLowerCase();
+      const hasNavKeyword = navKeywords.some(kw => lower.includes(kw));
+      const isShort = t.length < 50 && !t.includes("  ");
+      if (!hasNavKeyword && !isShort) return;
+      if (seen.has(t)) return;
+      seen.add(t);
+      let href = null;
+      if (el.tagName === "A" && el.getAttribute("href")) {
+        href = el.getAttribute("href");
+      } else {
+        const a = el.closest("a[href]");
+        if (a) href = a.getAttribute("href");
       }
+      results.push({ label: t, href });
     });
-    return Array.from(texts);
-  }, CLICKABLE_SELECTORS);
+    return results;
+  }, CLICKABLE_SELECTORS, SIDEBAR_SELECTOR);
 
   const base = BASE_URL.replace(/\/$/, "");
-  const urls = [];
-  for (const label of labels) {
-    const key = labelToRouteKey(label);
-    if (key) {
-      urls.push(`${base}${key}`);
+  const byKey = new Map();
+  for (const { label, href } of items) {
+    let key = null;
+    if (href && href.startsWith("#")) {
+      const u = new URL(base);
+      u.hash = href;
+      key = routeKey(u.href);
+    } else if (href && !href.startsWith("http")) {
+      key = routeKey(new URL(href, base).href);
+    }
+    if (key && !byKey.has(key)) {
+      byKey.set(key, { url: `${base}${key}`, label: cleanLabelForBreadcrumb(label) });
     }
   }
-  return [...new Set(urls)];
+  for (const { label, href } of items) {
+    const key = labelToRouteKey(label);
+    if (key && !byKey.has(key)) {
+      byKey.set(key, { url: `${base}${key}`, label: cleanLabelForBreadcrumb(label) });
+    }
+  }
+  return Array.from(byKey.entries()).map(([k, v]) => ({ key: k, url: v.url, label: v.label }));
 }
 
 // ── Route Discovery (click-based with capture) ─────────────────────────────
@@ -396,13 +470,16 @@ async function seedSidebarRoutesFromPage(page) {
  *   1. URL changes (hash or path) — detected by comparing URLs
  *   2. Content-only changes (React state) — detected by content fingerprinting
  *
- * For type 2, we derive a route key from the button label since there's
- * no URL to extract it from.
+ * Builds a breadcrumb trail from the path of clicks: e.g. "Components/Badge".
+ * fromBreadcrumb is the current page's breadcrumb (e.g. "Components"); new pages get
+ * fromBreadcrumb + "/" + clickedLabel, or just clickedLabel when starting from landing.
  *
  * Returns an array of newly discovered route URLs.
  */
-async function discoverAndCapture(page, requestContext, fromKey) {
+async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb) {
   const newRouteUrls = [];
+  const effectiveBreadcrumb = fromBreadcrumb != null ? fromBreadcrumb : (navMap.get(fromKey)?.label ?? keyToDefaultLabel(fromKey));
+  const isTopLevel = !fromKey || fromKey === "/" || fromKey === "#/" || fromKey === "#";
 
   // 1. Scan all <a href="..."> including hash links → just collect URLs
   const hrefs = await page.evaluate(() => {
@@ -487,10 +564,24 @@ async function discoverAndCapture(page, requestContext, fromKey) {
     // Standard filtering: has nav keyword, or is short (< 30 chars)
     if (navKeywords.some(kw => lowerText.includes(kw)) || (text.length > 0 && text.length < 30 && !lowerText.includes('collapse') && !lowerText.includes('view ai'))) {
       clickTargets.push(el);
+      continue;
+    }
+
+    // Content-crawl mode: click ANY button/clickable that might change the page content
+    // (URL may stay the same but elements change — tabs, accordions, state-driven views)
+    const isAnyButton = await el.evaluate(e => {
+      const tag = e.tagName.toLowerCase();
+      const role = (e.getAttribute("role") || "").toLowerCase();
+      const isButton = tag === "button" || role === "button" || role === "tab" || role === "option";
+      const isClickable = e.classList.contains("cursor-pointer") || e.getAttribute("tabindex") === "0";
+      return isButton || isClickable;
+    });
+    if (isAnyButton && text.length > 0 && text.length < 100 && !lowerText.includes("collapse") && !lowerText.includes("view ai")) {
+      clickTargets.push(el);
     }
   }
 
-  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable nav elements (filtered from ${allClickTargets.length})`);
+  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable elements (filtered from ${allClickTargets.length})`);
 
   // Track labels we've already clicked to avoid duplicates (use normalized key on components page)
   const clickedLabels = new Set();
@@ -557,7 +648,7 @@ async function discoverAndCapture(page, requestContext, fromKey) {
         if (urlChanged) {
           key = routeKey(urlAfter);
         } else {
-          // URL didn't change — derive key from button label
+          // URL didn't change — derive key from button label (content-only navigation)
           // On components listing page, derive #/components/button from "Button" / "Button Complete"
           const isFromComponentsListing = fromKey && (
             fromKey === "#/components" || fromKey === "/components"
@@ -565,19 +656,37 @@ async function discoverAndCapture(page, requestContext, fromKey) {
           if (isFromComponentsListing) {
             key = labelToComponentDetailRouteKey(labelInfo.text) || labelToRouteKey(labelInfo.text);
           } else {
-            key = labelToRouteKey(labelInfo.text);
+            // Any other page: nest under current route so we get #/overview/usage, #/colors/palette, etc.
+            key = deriveContentRouteKey(fromKey, labelInfo.text) || labelToRouteKey(labelInfo.text);
           }
         }
 
         if (key && !capturedRoutes.has(key)) {
-          console.log(`    🔀 Nav click → ${key} (url: ${urlChanged ? "changed" : "same"}, content: ${contentChanged ? "changed" : "same"})`);
+          const displayLabel = cleanLabelForBreadcrumb(labelInfo.text);
+          const newBreadcrumb = isTopLevel ? displayLabel : (effectiveBreadcrumb + "/" + displayLabel);
+          console.log(`    🔀 Nav click → ${key} (${newBreadcrumb}) (url: ${urlChanged ? "changed" : "same"}, content: ${contentChanged ? "changed" : "same"})`);
 
-          // Record in nav map for building sidebar links later
-          navMap.set(key, { label: labelInfo.text });
+          // Record breadcrumb trail for sidebar: e.g. "Components/Badge"
+          navMap.set(key, { label: newBreadcrumb });
 
           // Wait for content to fully render
           await page.waitForTimeout(RENDER_DELAY);
           await page.waitForSelector("body *", { timeout: 5000 }).catch(() => {});
+
+          // Content fingerprint to detect duplicate content (same view under different buttons)
+          const fingerprint = await getContentFingerprint(page);
+          const duplicateFingerprint = [...capturedRoutes.values()].some(r => r._fingerprint && r._fingerprint === fingerprint);
+          if (duplicateFingerprint) {
+            console.log(`    ⏭️  Skip ${key} — content identical to existing page (fingerprint match)`);
+            if (urlChanged) {
+              await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
+              await page.waitForTimeout(800);
+            } else {
+              await page.goto(page.url(), { waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded", timeout: TIMEOUT });
+              await page.waitForTimeout(RENDER_DELAY);
+            }
+            continue;
+          }
 
           // Capture content RIGHT NOW while React has rendered it
           const [html, cssBlocks, assetUrls] = await Promise.all([
@@ -607,6 +716,7 @@ async function discoverAndCapture(page, requestContext, fromKey) {
             html,
             css: cssBlocks.join("\n\n"),
             newRoutes: [],
+            _fingerprint: fingerprint,
           });
           discoveredRoutes.add(key);
           console.log(`    ✅ Captured ${key} via click`);
@@ -758,6 +868,9 @@ async function captureRoute(page, url, requestContext) {
       _fingerprint: finalFingerprint,
     };
 
+    if (!navMap.has(key)) {
+      navMap.set(key, { label: keyToDefaultLabel(key) });
+    }
     capturedRoutes.set(key, result);
     return result;
   } catch (err) {
@@ -910,25 +1023,21 @@ function buildNavBar(currentKey) {
     let rel = path.relative(currentDir, targetFile).replace(/\\/g, "/");
     if (!rel.startsWith(".")) rel = "./" + rel;
     const isActive = key === currentKey;
-    const activeClass = isActive ? ' class="nav-active"' : '';
-    return `<a href="${rel}"${activeClass}>${label}</a>`;
+    const depth = (label.match(/\//g) || []).length;
+    const depthClass = depth > 0 ? ` nav-depth-${depth}` : "";
+    const activeClass = isActive ? " nav-active" : "";
+    return `<a href="${rel}" class="nav-item${depthClass}${activeClass}">${label}</a>`;
   }
 
   function keyToLabel(key) {
-    // Use navMap label if available, otherwise derive from key
+    // Use breadcrumb from navMap (e.g. "Components/Badge") so sidebar shows full path
     if (navMap.has(key)) {
       const raw = navMap.get(key).label;
-      // Clean up MUI icon text (e.g., "palette Colors" → "Colors")
-      // Icon text is typically a single lowercase word followed by the label
+      if (raw.includes("/")) return raw; // full breadcrumb: show as-is
       const cleaned = raw.replace(/^[a-z_]+\s+/, "");
       return cleaned || raw;
     }
-    const cleaned = key
-      .replace(/^#\//, "")
-      .replace(/^\//, "")
-      .split("/").pop()
-      .replace(/-/g, " ");
-    return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+    return keyToDefaultLabel(key);
   }
 
   let nav = `<nav class="static-nav" aria-label="Page navigation">\n`;
@@ -1007,7 +1116,7 @@ const NAV_CSS = `
   letter-spacing: 1px;
   color: #8a8fa8;
 }
-.static-nav a {
+.static-nav a.nav-item {
   display: block;
   padding: 7px 16px 7px 20px;
   color: #c1c7d7;
@@ -1015,11 +1124,14 @@ const NAV_CSS = `
   transition: background 0.15s, color 0.15s;
   border-left: 3px solid transparent;
 }
-.static-nav a:hover {
+.static-nav a.nav-depth-1 { padding-left: 28px; font-size: 12px; }
+.static-nav a.nav-depth-2 { padding-left: 36px; font-size: 12px; }
+.static-nav a.nav-depth-3 { padding-left: 44px; font-size: 12px; }
+.static-nav a.nav-item:hover {
   background: rgba(255,255,255,0.07);
   color: #fff;
 }
-.static-nav a.nav-active {
+.static-nav a.nav-item.nav-active {
   background: rgba(255,255,255,0.1);
   color: #7ef29d;
   border-left-color: #7ef29d;
@@ -1135,27 +1247,27 @@ async function main() {
     _fingerprint: landingFingerprint,
   });
   discoveredRoutes.add(landingKey);
+  navMap.set(landingKey, { label: "Overview" });
   console.log(`  ✅ Landing: ${landingKey} (fingerprint: ${landingFingerprint.slice(0, 40)}...)\n`);
 
-  // ── Step 1b: Seed queue with sidebar routes from current page ───────────
-  //    Guarantees Colors, Components, Overview, etc. are always crawled
-  //    even if href/click discovery fails (CI, viewport, or SPA not updating URL).
-  const seededUrls = await seedSidebarRoutesFromPage(page);
-  for (const url of seededUrls) {
-    const k = routeKey(url);
-    if (k && !discoveredRoutes.has(k)) {
-      discoveredRoutes.add(k);
+  // ── Step 1b: Seed queue from sidebar only (base pages: Overview, Colors, Typography, Components, etc.) ──
+  const seeded = await seedSidebarRoutesFromPage(page);
+  for (const { key, url, label } of seeded) {
+    if (key && !discoveredRoutes.has(key)) {
+      discoveredRoutes.add(key);
+      navMap.set(key, { label });
     }
   }
-  console.log(`  🌱 Seeded ${seededUrls.length} sidebar routes: ${seededUrls.map(u => routeKey(u)).join(", ")}\n`);
+  const seededUrls = seeded.map(s => s.url);
+  console.log(`  🌱 Seeded ${seeded.length} sidebar base pages: ${seeded.map(s => s.label).join(", ")}\n`);
 
-  // ── Step 2: Discover routes by clicking nav elements & capture ────────
+  // ── Step 2: Discover routes by clicking nav elements & capture (breadcrumb starts at landing) ────────
   console.log("🔍 Discovering routes via navigation clicks...\n");
-  const initialRoutes = await discoverAndCapture(page, context.request, landingKey);
+  const initialRoutes = await discoverAndCapture(page, context.request, landingKey, "Overview");
   console.log(`\n  📍 Discovered ${initialRoutes.length} additional route URLs\n`);
 
-  // ── Step 3: Build queue (seeded + discovered) and capture remaining ────
-  const routeQueue = [...seededUrls, ...initialRoutes];
+  // ── Step 3: Build queue (seeded + discovered) and capture remaining; crawl down from each ────
+  const routeQueue = seededUrls.concat(initialRoutes);
   for (const r of routeQueue) {
     discoveredRoutes.add(routeKey(r));
   }
@@ -1179,10 +1291,10 @@ async function main() {
       }
     }
 
-    // After capturing a page, try discovering more routes via clicks
-    // (only if this is a page with potential navigation)
+    // After capturing a page, crawl down: discover buttons/links and capture with breadcrumb trail
     if (result) {
-      const moreRoutes = await discoverAndCapture(page, context.request, key);
+      const pageBreadcrumb = navMap.get(key)?.label ?? keyToDefaultLabel(key);
+      const moreRoutes = await discoverAndCapture(page, context.request, key, pageBreadcrumb);
       for (const newUrl of moreRoutes) {
         const newKey = routeKey(newUrl);
         if (newKey && !discoveredRoutes.has(newKey)) {
