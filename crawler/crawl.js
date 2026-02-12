@@ -507,6 +507,75 @@ async function seedSidebarRoutesFromPage(page) {
 
 // ── Route Discovery (click-based with capture) ─────────────────────────────
 
+const NAV_KEYWORDS = [
+  'overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation',
+  'home', 'about', 'docs', 'guide', 'api', 'settings',
+  'button', 'card', 'chip', 'input', 'select', 'modal', 'dialog', 'tooltip', 'dropdown',
+  'menu', 'table', 'form', 'checkbox', 'radio', 'switch', 'slider', 'badge', 'avatar',
+  'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
+  'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
+];
+
+/**
+ * Get filtered click targets for the current page. Used so we can re-query after
+ * navigation and avoid "Execution context was destroyed" from stale handles.
+ */
+async function getFilteredClickTargets(page) {
+  const currentUrl = page.url();
+  const isComponentsListingPage = /#\/components\/?$|\/components\/?$/.test(routeKey(currentUrl) || "");
+  const allClickTargets = await page.$$(CLICKABLE_SELECTORS);
+  const clickTargets = [];
+  for (const el of allClickTargets) {
+    try {
+      const text = await el.evaluate(e => (e.textContent || "").trim().replace(/\s+/g, " "));
+      const lowerText = text.toLowerCase();
+      if (isComponentsListingPage) {
+        const isComponentDetailLink = await el.evaluate(e => {
+          if (e.tagName === "A") {
+            const href = (e.getAttribute("href") || "").trim();
+            return href.includes("/components/") && href !== "#/components" && href !== "/components";
+          }
+          return false;
+        });
+        const looksLikeComponentCard = await el.evaluate(e => {
+          const hasCardClass = /card|Card/.test(e.className || "");
+          const hasPointer = e.classList.contains("cursor-pointer") || e.getAttribute("role") === "button";
+          const hasDataSlot = e.hasAttribute("data-slot");
+          const href = e.closest("a")?.getAttribute("href") || e.getAttribute("href") || "";
+          const isComponentHref = href.includes("/components/") && href !== "#/components" && href !== "/components";
+          return hasCardClass || hasPointer || hasDataSlot || isComponentHref;
+        });
+        const componentSlug = labelToComponentDetailRouteKey(text);
+        if ((isComponentDetailLink || (looksLikeComponentCard && componentSlug)) && text.length > 0 && text.length < 120) {
+          clickTargets.push(el);
+          continue;
+        }
+        if (componentSlug && text.length > 0 && text.length < 80) {
+          clickTargets.push(el);
+          continue;
+        }
+      }
+      if (NAV_KEYWORDS.some(kw => lowerText.includes(kw)) || (text.length > 0 && text.length < 30 && !lowerText.includes('collapse') && !lowerText.includes('view ai'))) {
+        clickTargets.push(el);
+        continue;
+      }
+      const isAnyButton = await el.evaluate(e => {
+        const tag = e.tagName.toLowerCase();
+        const role = (e.getAttribute("role") || "").toLowerCase();
+        const isButton = tag === "button" || role === "button" || role === "tab" || role === "option";
+        const isClickable = e.classList.contains("cursor-pointer") || e.getAttribute("tabindex") === "0";
+        return isButton || isClickable;
+      });
+      if (isAnyButton && text.length > 0 && text.length < 100 && !lowerText.includes("collapse") && !lowerText.includes("view ai")) {
+        clickTargets.push(el);
+      }
+    } catch (err) {
+      if (!err.message.includes('Execution context was destroyed')) throw err;
+    }
+  }
+  return clickTargets;
+}
+
 /**
  * Discover routes AND capture content by clicking navigation elements.
  *
@@ -552,87 +621,19 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
     }
   }
 
-  // 2. Click nav elements: capture content right when we navigate
-  //    Detect BOTH url changes AND content-only changes
-  const allClickTargets = await page.$$(CLICKABLE_SELECTORS);
+  // 2. Click nav elements: capture content right when we navigate.
+  //    Re-query click targets after each navigation to avoid stale handles ("Execution context was destroyed").
+  let clickTargets = await getFilteredClickTargets(page);
+  const isComponentsListingPage = /#\/components\/?$|\/components\/?$/.test(routeKey(page.url()) || "");
 
-  // Filter to only navigation-looking elements
-  const navKeywords = [
-    'overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation',
-    'home', 'about', 'docs', 'guide', 'api', 'settings',
-    // Component keywords for sub-page discovery
-    'button', 'card', 'chip', 'input', 'select', 'modal', 'dialog', 'tooltip', 'dropdown',
-    'menu', 'table', 'form', 'checkbox', 'radio', 'switch', 'slider', 'badge', 'avatar',
-    'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
-    'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
-  ];
+  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable elements`);
 
-  // Check if we're on the components listing page (so we crawl Button, Tab, Badge, etc.)
-  const currentUrl = page.url();
-  const isComponentsListingPage = /#\/components\/?$|\/components\/?$/.test(routeKey(currentUrl) || "");
-
-  const clickTargets = [];
-  for (const el of allClickTargets) {
-    const text = await el.evaluate(e => (e.textContent || "").trim().replace(/\s+/g, " "));
-    const lowerText = text.toLowerCase();
-
-    // On components listing page: click every link/card that leads to a component detail page
-    if (isComponentsListingPage) {
-      const isComponentDetailLink = await el.evaluate(e => {
-        if (e.tagName === "A") {
-          const href = (e.getAttribute("href") || "").trim();
-          return href.includes("/components/") && href !== "#/components" && href !== "/components";
-        }
-        return false;
-      });
-      const looksLikeComponentCard = await el.evaluate(e => {
-        const hasCardClass = /card|Card/.test(e.className || "");
-        const hasPointer = e.classList.contains("cursor-pointer") || e.getAttribute("role") === "button";
-        const hasDataSlot = e.hasAttribute("data-slot");
-        const href = e.closest("a")?.getAttribute("href") || e.getAttribute("href") || "";
-        const isComponentHref = href.includes("/components/") && href !== "#/components" && href !== "/components";
-        return hasCardClass || hasPointer || hasDataSlot || isComponentHref;
-      });
-      const componentSlug = labelToComponentDetailRouteKey(text);
-      if ((isComponentDetailLink || (looksLikeComponentCard && componentSlug)) && text.length > 0 && text.length < 120) {
-        clickTargets.push(el);
-        continue;
-      }
-      // Also include any short label that looks like a component name (Button, Tab, Badge, etc.)
-      if (componentSlug && text.length > 0 && text.length < 80) {
-        clickTargets.push(el);
-        continue;
-      }
-    }
-
-    // Standard filtering: has nav keyword, or is short (< 30 chars)
-    if (navKeywords.some(kw => lowerText.includes(kw)) || (text.length > 0 && text.length < 30 && !lowerText.includes('collapse') && !lowerText.includes('view ai'))) {
-      clickTargets.push(el);
-      continue;
-    }
-
-    // Content-crawl mode: click ANY button/clickable that might change the page content
-    // (URL may stay the same but elements change — tabs, accordions, state-driven views)
-    const isAnyButton = await el.evaluate(e => {
-      const tag = e.tagName.toLowerCase();
-      const role = (e.getAttribute("role") || "").toLowerCase();
-      const isButton = tag === "button" || role === "button" || role === "tab" || role === "option";
-      const isClickable = e.classList.contains("cursor-pointer") || e.getAttribute("tabindex") === "0";
-      return isButton || isClickable;
-    });
-    if (isAnyButton && text.length > 0 && text.length < 100 && !lowerText.includes("collapse") && !lowerText.includes("view ai")) {
-      clickTargets.push(el);
-    }
-  }
-
-  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable elements (filtered from ${allClickTargets.length})`);
-
-  // Track labels we've already clicked to avoid duplicates (use normalized key on components page)
   const clickedLabels = new Set();
+  let index = 0;
 
-  for (const el of clickTargets) {
+  while (index < clickTargets.length) {
+    const el = clickTargets[index];
     try {
-      // Get the label/text before clicking (for nav map + route derivation)
       let labelInfo;
       try {
         labelInfo = await el.evaluate(e => {
@@ -640,36 +641,39 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
           return { text };
         });
       } catch (err) {
+        if (err.message.includes('Execution context was destroyed')) throw err;
         console.log(`    ⚠️ Click error: ${err.message}`);
+        index++;
         continue;
       }
 
-      // Dedupe: on components page use normalized component key (Button Complete === Button)
       const dedupeKey = isComponentsListingPage && labelToComponentDetailRouteKey(labelInfo.text)
         ? labelToComponentDetailRouteKey(labelInfo.text)
         : labelInfo.text;
-      if (clickedLabels.has(dedupeKey)) continue;
+      if (clickedLabels.has(dedupeKey)) {
+        index++;
+        continue;
+      }
       clickedLabels.add(dedupeKey);
 
       const urlBefore = page.url();
       const contentBefore = await getContentFingerprint(page);
 
-      // Try clicking with better error handling
       let clickSucceeded = false;
       try {
         await el.click({ timeout: 2000, force: true });
         clickSucceeded = true;
       } catch (err) {
-        // If execution context was destroyed, the navigation might have happened anyway
-        if (!err.message.includes('Execution context was destroyed')) {
-          console.log(`    ⚠️ Click error: ${err.message}`);
-          continue;
-        }
-        // Continue anyway - navigation may have occurred
-        clickSucceeded = true;
+        if (err.message.includes('Execution context was destroyed')) throw err;
+        console.log(`    ⚠️ Click error: ${err.message}`);
+        index++;
+        continue;
       }
 
-      if (!clickSucceeded) continue;
+      if (!clickSucceeded) {
+        index++;
+        continue;
+      }
 
       await page.waitForTimeout(1500);
 
@@ -678,8 +682,9 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
         urlAfter = page.url();
         contentAfter = await getContentFingerprint(page);
       } catch (err) {
-        // Page might have navigated, skip this element
+        if (err.message.includes('Execution context was destroyed')) throw err;
         console.log(`    ⚠️ Navigation error after click: ${err.message}`);
+        index++;
         continue;
       }
 
@@ -687,20 +692,16 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
       const contentChanged = contentAfter !== contentBefore;
 
       if (urlChanged || contentChanged) {
-        // Determine the route key
         let key;
         if (urlChanged) {
           key = routeKey(urlAfter);
         } else {
-          // URL didn't change — derive key from button label (content-only navigation)
-          // On components listing page, derive #/components/button from "Button" / "Button Complete"
           const isFromComponentsListing = fromKey && (
             fromKey === "#/components" || fromKey === "/components"
           );
           if (isFromComponentsListing) {
             key = labelToComponentDetailRouteKey(labelInfo.text) || labelToRouteKey(labelInfo.text);
           } else {
-            // Any other page: nest under current route so we get #/overview/usage, #/colors/palette, etc.
             key = deriveContentRouteKey(fromKey, labelInfo.text) || labelToRouteKey(labelInfo.text);
           }
         }
@@ -710,14 +711,11 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
           const newBreadcrumb = isTopLevel ? displayLabel : (effectiveBreadcrumb + "/" + displayLabel);
           console.log(`    🔀 Nav click → ${key} (${newBreadcrumb}) (url: ${urlChanged ? "changed" : "same"}, content: ${contentChanged ? "changed" : "same"})`);
 
-          // Record breadcrumb trail for sidebar: e.g. "Components/Badge"
           navMap.set(key, { label: newBreadcrumb });
 
-          // Wait for content to fully render
           await page.waitForTimeout(RENDER_DELAY);
           await page.waitForSelector("body *", { timeout: 5000 }).catch(() => {});
 
-          // Content fingerprint to detect duplicate content (same view under different buttons)
           const fingerprint = await getContentFingerprint(page);
           const duplicateFingerprint = [...capturedRoutes.values()].some(r => r._fingerprint && r._fingerprint === fingerprint);
           if (duplicateFingerprint) {
@@ -729,10 +727,11 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
               await page.goto(page.url(), { waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded", timeout: TIMEOUT });
               await page.waitForTimeout(RENDER_DELAY);
             }
+            clickTargets = await getFilteredClickTargets(page);
+            index = 0;
             continue;
           }
 
-          // Capture content RIGHT NOW while React has rendered it
           const [html, cssBlocks, assetUrls] = await Promise.all([
             extractCleanHTML(page),
             extractAllCSS(page),
@@ -765,7 +764,6 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
           discoveredRoutes.add(key);
           console.log(`    ✅ Captured ${key} via click`);
 
-          // Discover sub-links from this page
           const subHrefs = await page.evaluate(() => {
             return Array.from(document.querySelectorAll("a[href]")).map(a => {
               return { href: a.href, rawHref: a.getAttribute("href") };
@@ -789,22 +787,33 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
           }
         }
 
-        // Navigate back so we can click the next element
         if (urlChanged) {
           await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
           await page.waitForTimeout(800);
         } else {
-          // URL didn't change — click the "home" / first nav element to go back
-          // or reload the page to reset state
           await page.goto(page.url(), {
             waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
             timeout: TIMEOUT,
           });
           await page.waitForTimeout(RENDER_DELAY);
         }
+        clickTargets = await getFilteredClickTargets(page);
+        index = 0;
+        continue;
       }
+      index++;
     } catch (err) {
-      console.log(`    ⚠️ Click error: ${err.message}`);
+      if (err.message.includes('Execution context was destroyed')) {
+        try {
+          await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
+        } catch (_) {}
+        await page.waitForTimeout(500);
+        clickTargets = await getFilteredClickTargets(page);
+        index = 0;
+      } else {
+        console.log(`    ⚠️ Click error: ${err.message}`);
+        index++;
+      }
     }
   }
 
