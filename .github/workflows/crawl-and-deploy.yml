@@ -17,11 +17,11 @@ on:
       wait_for_network:
         description: "Wait for full network idle (slower, more complete)"
         required: false
-        default: "true"
+        default: "false"
         type: choice
         options:
-          - "true"
           - "false"
+          - "true"
 
   # ── Schedule — uncomment + set your cron ──────────────────────────────
   # schedule:
@@ -81,7 +81,7 @@ jobs:
           SITE_URL: ${{ inputs.site_url || env.DEFAULT_SITE_URL }}
           OUTPUT_DIR: ./static-output
           MAX_PAGES: ${{ inputs.max_pages || '50' }}
-          WAIT_FOR_NETWORK: ${{ inputs.wait_for_network || 'true' }}
+          WAIT_FOR_NETWORK: ${{ inputs.wait_for_network || 'false' }}
           CONCURRENCY: "3"
           PAGE_TIMEOUT: "30000"
           DOWNLOAD_ASSETS: "true"

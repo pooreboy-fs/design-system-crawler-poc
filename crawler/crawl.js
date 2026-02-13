@@ -36,6 +36,28 @@ const downloadedAssets = new Map(); // original URL → local path
 const discoveredRoutes = new Set(); // all route keys we've seen
 const navMap = new Map(); // route key → { label, icon } for building navigation
 
+// ── Resilient Navigation ──────────────────────────────────────────────────
+
+/**
+ * Navigate to a URL with automatic retry on timeout.
+ * First attempt uses the configured wait strategy; on timeout, falls back
+ * to "domcontentloaded" which is far more reliable for SPAs like Figma sites.
+ */
+async function safeGoto(page, url, opts = {}) {
+  const waitUntil = opts.waitUntil || (WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded");
+  const timeout = opts.timeout || TIMEOUT;
+  try {
+    await page.goto(url, { waitUntil, timeout });
+  } catch (err) {
+    if (err.name === "TimeoutError" && waitUntil === "networkidle") {
+      console.log(`    ⚠️  networkidle timeout on ${url}, retrying with domcontentloaded...`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout });
+    } else {
+      throw err;
+    }
+  }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /**
@@ -582,7 +604,7 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb,
     if (navigateToFromPage) {
       await navigateToFromPage();
     } else {
-      await page.goto(BASE_URL, { waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded", timeout: TIMEOUT }).catch(() => {});
+      await safeGoto(page, BASE_URL).catch(() => {});
       await page.waitForTimeout(RENDER_DELAY);
     }
   }
@@ -786,10 +808,7 @@ async function captureRoute(page, url, requestContext) {
   try {
     // Step 1: Full page reload with the hash URL
     // This works if the SPA reads window.location.hash on initialization
-    await page.goto(url, {
-      waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-      timeout: TIMEOUT,
-    });
+    await safeGoto(page, url);
     await page.waitForTimeout(RENDER_DELAY);
 
     // Step 2: Check if we got different content than the landing page
@@ -1214,10 +1233,7 @@ async function main() {
   // ── Step 1: Load the site and capture landing page ────────────────────
   console.log("📡 Loading site and discovering routes...\n");
 
-  await page.goto(BASE_URL, {
-    waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-    timeout: TIMEOUT,
-  });
+  await safeGoto(page, BASE_URL);
   await page.waitForTimeout(RENDER_DELAY);
 
   // Capture the landing page first
@@ -1269,10 +1285,7 @@ async function main() {
     if (capturedRoutes.has(item.key)) continue;
 
     // Reload the site to get back to landing (clean state)
-    await page.goto(BASE_URL, {
-      waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-      timeout: TIMEOUT,
-    });
+    await safeGoto(page, BASE_URL);
     await page.waitForTimeout(RENDER_DELAY);
 
     // Click the sidebar button by its text
@@ -1337,10 +1350,7 @@ async function main() {
       const buttonText = item.buttonText;
       // Function to navigate back to this base page: reload site + click the sidebar button
       const navigateToThisPage = async () => {
-        await page.goto(BASE_URL, {
-          waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-          timeout: TIMEOUT,
-        });
+        await safeGoto(page, BASE_URL);
         await page.waitForTimeout(RENDER_DELAY);
         await clickByText(page, buttonText);
         await page.waitForTimeout(RENDER_DELAY);
