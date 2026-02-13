@@ -376,8 +376,12 @@ function cleanLabelForBreadcrumb(label) {
     .replace(/\s*New\s*/gi, " ")
     .trim()
     .replace(/\s+/g, " ");
-  // Strip leading icon word (e.g. "palette Colors" → "Colors")
+  // Strip leading icon word: "palette Colors" → "Colors"
   cleaned = cleaned.replace(/^[a-z_]+\s+/, "").trim();
+  // Strip camelCase icon prefix: "homeOverview" → "Overview", "text_fieldsTypography" → "Typography"
+  if (!cleaned.includes(" ")) {
+    cleaned = cleaned.replace(/^[a-z_]+(?=[A-Z])/, "");
+  }
   return cleaned || label.trim();
 }
 
@@ -397,202 +401,191 @@ function keyToDefaultLabel(key) {
 
 // ── Seed sidebar routes (guarantee main nav pages are in the queue) ───────
 
-// Selector for sidebar container (base pages only)
-const SIDEBAR_SELECTOR = "nav, [class*='sidebar'], [class*='Sidebar'], [role='navigation']";
+const BASE_NAV_KEYWORDS = [
+  "overview", "colors", "typography", "spacing", "components", "iconography", "navigation",
+  "home", "about", "docs", "guide", "api"
+];
 
 /**
- * Extract base page links from the sidebar only. Returns { key, url, label } for each
- * so we can set breadcrumbs (Overview, Colors, Typography, Components, etc.)
- * and use these as the only seed — everything else is discovered by crawling down.
+ * Collect sidebar/nav button labels directly from the page.
+ * Works even when there is no <nav>, no <a href>, no role=navigation —
+ * just plain <button> elements with text like "home Overview", "palette Colors", etc.
+ *
+ * Strategy: find ALL buttons on the page whose text (after stripping icon prefixes)
+ * matches a known base-page keyword. Return them as { label } items.
  */
 async function seedSidebarRoutesFromPage(page) {
-  const items = await page.evaluate(({ clickableSelector, sidebarSelector }) => {
-    const candidates = document.querySelectorAll(sidebarSelector);
-    let sidebar = null;
-    let maxLinks = 0;
-    candidates.forEach((cand) => {
-      const hashLinks = cand.querySelectorAll('a[href^="#"]');
-      const pathLinks = cand.querySelectorAll('a[href^="/"]');
-      const count = hashLinks.length + pathLinks.length;
-      if (count > maxLinks) {
-        maxLinks = count;
-        sidebar = cand;
-      }
-    });
-    if (!sidebar) return [];
-    const elements = sidebar.querySelectorAll(clickableSelector);
-    const seen = new Set();
+  const items = await page.evaluate((navKeywords) => {
     const results = [];
-    const navKeywords = [
-      "overview", "colors", "typography", "spacing", "components", "iconography", "navigation",
-      "home", "about", "docs", "guide", "api"
-    ];
+    const seen = new Set();
+    // Collect from buttons AND links
+    const elements = document.querySelectorAll("button, a[href]");
     elements.forEach((el) => {
-      const t = (el.textContent || "").trim().replace(/\s+/g, " ");
-      if (t.length === 0 || t.length > 80) return;
-      if (!el.matches("a[href]") && t.length > 50) return;
-      const lower = t.toLowerCase();
-      const hasNavKeyword = navKeywords.some(kw => lower.includes(kw));
-      const isShort = t.length < 50 && !t.includes("  ");
-      if (!hasNavKeyword && !isShort) return;
-      if (seen.has(t)) return;
-      seen.add(t);
+      const rawText = (el.textContent || "").trim().replace(/\s+/g, " ");
+      if (rawText.length === 0 || rawText.length > 80) return;
+      // Strip icon prefix: "home Overview" → "Overview", "palette Colors" → "Colors"
+      const cleaned = rawText.replace(/^[a-z_]+\s+/i, "").trim();
+      const lower = (cleaned || rawText).toLowerCase();
+      const hasNavKeyword = navKeywords.some(kw => lower === kw || lower.includes(kw));
+      if (!hasNavKeyword) return;
+      // Avoid duplicates and non-nav items
+      const dedup = cleaned.toLowerCase();
+      if (seen.has(dedup)) return;
+      seen.add(dedup);
+      // Get href if it's a link
       let href = null;
-      if (el.tagName === "A" && el.getAttribute("href")) {
-        href = el.getAttribute("href");
-      } else {
-        const a = el.closest("a[href]");
-        if (a) href = a.getAttribute("href");
-      }
-      results.push({ label: t, href });
+      if (el.tagName === "A") href = el.getAttribute("href");
+      results.push({ rawText, cleaned, href });
     });
     return results;
-  }, { clickableSelector: CLICKABLE_SELECTORS, sidebarSelector: SIDEBAR_SELECTOR });
+  }, BASE_NAV_KEYWORDS);
+
+  console.log(`    🔎 seedSidebarRoutesFromPage found ${items.length} nav items: ${items.map(i => i.cleaned).join(", ")}`);
 
   const base = BASE_URL.replace(/\/$/, "");
-  const byKey = new Map();
-  for (const { label, href } of items) {
+  const results = [];
+  const seenKeys = new Set();
+  for (const { rawText, cleaned, href } of items) {
     let key = null;
     if (href && href.startsWith("#")) {
       const u = new URL(base);
       u.hash = href;
       key = routeKey(u.href);
-    } else if (href && !href.startsWith("http")) {
-      key = routeKey(new URL(href, base).href);
+    } else if (href && !href.startsWith("http") && !href.startsWith("//")) {
+      try { key = routeKey(new URL(href, base).href); } catch {}
     }
-    if (key && !byKey.has(key)) {
-      byKey.set(key, { url: `${base}${key}`, label: cleanLabelForBreadcrumb(label) });
+    if (!key) {
+      key = labelToRouteKey(rawText);
     }
-  }
-  for (const { label, href } of items) {
-    const key = labelToRouteKey(label);
-    if (key && !byKey.has(key)) {
-      byKey.set(key, { url: `${base}${key}`, label: cleanLabelForBreadcrumb(label) });
-    }
-  }
-
-  if (byKey.size <= 1) {
-    const fallbackLinks = await page.evaluate(() => {
-      const out = [];
-      document.querySelectorAll('a[href^="#"]').forEach((a) => {
-        const href = a.getAttribute("href");
-        const label = (a.textContent || "").trim().replace(/\s+/g, " ");
-        if (href && href.length > 1) out.push({ href, label: label.slice(0, 80), isPath: false });
+    if (key && !seenKeys.has(key)) {
+      seenKeys.add(key);
+      results.push({
+        key,
+        url: `${base}${key}`,
+        label: cleanLabelForBreadcrumb(cleaned || rawText),
+        buttonText: rawText, // exact text to find the button later
       });
-      document.querySelectorAll('a[href^="/"]').forEach((a) => {
-        const href = a.getAttribute("href");
-        const label = (a.textContent || "").trim().replace(/\s+/g, " ");
-        if (href && !href.startsWith("//")) out.push({ href, label: label.slice(0, 80), isPath: true });
-      });
-      return out;
-    });
-    for (const { href, label, isPath } of fallbackLinks) {
-      let key = null;
-      if (href.startsWith("#")) {
-        const u = new URL(base);
-        u.hash = href;
-        key = routeKey(u.href);
-      } else if (isPath && href.startsWith("/")) {
-        key = routeKey(new URL(href, base).href);
-      }
-      if (key && !byKey.has(key)) {
-        const displayLabel = label && label.length > 0 ? cleanLabelForBreadcrumb(label) : keyToDefaultLabel(key);
-        byKey.set(key, { url: `${base}${key}`, label: displayLabel });
-      }
     }
   }
-
-  return Array.from(byKey.entries()).map(([k, v]) => ({ key: k, url: v.url, label: v.label }));
+  return results;
 }
 
 // ── Route Discovery (click-based with capture) ─────────────────────────────
 
-const NAV_KEYWORDS = [
-  'overview', 'colors', 'typography', 'spacing', 'components', 'iconography', 'navigation',
-  'home', 'about', 'docs', 'guide', 'api', 'settings',
-  'button', 'card', 'chip', 'input', 'select', 'modal', 'dialog', 'tooltip', 'dropdown',
-  'menu', 'table', 'form', 'checkbox', 'radio', 'switch', 'slider', 'badge', 'avatar',
-  'alert', 'toast', 'accordion', 'tabs', 'breadcrumb', 'pagination', 'progress', 'spinner',
-  'divider', 'skeleton', 'popover', 'drawer', 'sheet', 'calendar', 'datepicker'
-];
+/**
+ * Collect all clickable labels (buttons, links, cards) from the current page.
+ * Returns an array of { text, cleaned } strings — no element handles stored.
+ * This is safe across navigations: we re-find the element by text each time.
+ */
+const CLICKABLE_QUERY = "button, a[href], [role='button'], [role='tab'], [tabindex='0'], [class*='cursor-pointer']";
+
+async function collectClickableLabels(page) {
+  return await page.evaluate((clickableQuery) => {
+    const results = [];
+    const seen = new Set();
+    const skipPatterns = /collapse|search design|view ai|^copy$/i;
+
+    // Gather from standard clickable elements
+    document.querySelectorAll(clickableQuery).forEach((el) => {
+      const raw = (el.textContent || "").trim().replace(/\s+/g, " ");
+      if (raw.length === 0 || raw.length > 200) return;
+      if (skipPatterns.test(raw)) return;
+      if (seen.has(raw)) return;
+      seen.add(raw);
+      const heading = el.querySelector("h1, h2, h3, h4");
+      const shortLabel = heading ? (heading.textContent || "").trim().replace(/\s+/g, " ") : null;
+      results.push({ text: raw, shortLabel });
+    });
+
+    // Also look for "card-like" divs: elements that have an h3 inside and look clickable
+    // (have border/rounded styling, arrow icon, or cursor-pointer in any ancestor)
+    document.querySelectorAll("div").forEach((el) => {
+      const h3 = el.querySelector("h3");
+      if (!h3) return;
+      // Only consider direct card containers (not deeply nested wrappers)
+      const parentH3s = el.querySelectorAll("h3");
+      if (parentH3s.length > 1) return; // skip wrapper divs that contain multiple cards
+      const raw = (el.textContent || "").trim().replace(/\s+/g, " ");
+      if (raw.length === 0 || raw.length > 200) return;
+      if (seen.has(raw)) return;
+      // Must look "card-like": has border, rounded corners, arrow, or explicit click handler
+      const style = window.getComputedStyle(el);
+      const hasBorder = style.borderWidth !== "0px" && style.borderStyle !== "none";
+      const hasRounded = style.borderRadius !== "0px";
+      const hasArrow = el.querySelector("svg, [class*='arrow'], [class*='chevron']") !== null;
+      const hasCursor = style.cursor === "pointer";
+      if (!hasBorder && !hasRounded && !hasArrow && !hasCursor) return;
+      seen.add(raw);
+      const shortLabel = (h3.textContent || "").trim().replace(/\s+/g, " ");
+      results.push({ text: raw, shortLabel: shortLabel || null });
+    });
+
+    return results;
+  }, CLICKABLE_QUERY);
+}
 
 /**
- * Get filtered click targets for the current page. Used so we can re-query after
- * navigation and avoid "Execution context was destroyed" from stale handles.
+ * Find and click a button/link by its text content.
+ * Re-queries the DOM each time so we never use stale handles.
+ * Returns true if the element was found and clicked.
  */
-async function getFilteredClickTargets(page) {
-  const currentUrl = page.url();
-  const isComponentsListingPage = /#\/components\/?$|\/components\/?$/.test(routeKey(currentUrl) || "");
-  const allClickTargets = await page.$$(CLICKABLE_SELECTORS);
-  const clickTargets = [];
-  for (const el of allClickTargets) {
-    try {
-      const text = await el.evaluate(e => (e.textContent || "").trim().replace(/\s+/g, " "));
-      const lowerText = text.toLowerCase();
-      if (isComponentsListingPage) {
-        const isComponentDetailLink = await el.evaluate(e => {
-          if (e.tagName === "A") {
-            const href = (e.getAttribute("href") || "").trim();
-            return href.includes("/components/") && href !== "#/components" && href !== "/components";
-          }
-          return false;
-        });
-        const looksLikeComponentCard = await el.evaluate(e => {
-          const hasCardClass = /card|Card/.test(e.className || "");
-          const hasPointer = e.classList.contains("cursor-pointer") || e.getAttribute("role") === "button";
-          const hasDataSlot = e.hasAttribute("data-slot");
-          const href = e.closest("a")?.getAttribute("href") || e.getAttribute("href") || "";
-          const isComponentHref = href.includes("/components/") && href !== "#/components" && href !== "/components";
-          return hasCardClass || hasPointer || hasDataSlot || isComponentHref;
-        });
-        const componentSlug = labelToComponentDetailRouteKey(text);
-        if ((isComponentDetailLink || (looksLikeComponentCard && componentSlug)) && text.length > 0 && text.length < 120) {
-          clickTargets.push(el);
-          continue;
-        }
-        if (componentSlug && text.length > 0 && text.length < 80) {
-          clickTargets.push(el);
-          continue;
-        }
+async function clickByText(page, text) {
+  const clicked = await page.evaluate(({ targetText, clickableQuery }) => {
+    // First try standard clickable elements
+    const elements = document.querySelectorAll(clickableQuery);
+    for (const el of elements) {
+      const t = (el.textContent || "").trim().replace(/\s+/g, " ");
+      if (t === targetText) {
+        el.click();
+        return true;
       }
-      if (NAV_KEYWORDS.some(kw => lowerText.includes(kw)) || (text.length > 0 && text.length < 30 && !lowerText.includes('collapse') && !lowerText.includes('view ai'))) {
-        clickTargets.push(el);
-        continue;
-      }
-      const isAnyButton = await el.evaluate(e => {
-        const tag = e.tagName.toLowerCase();
-        const role = (e.getAttribute("role") || "").toLowerCase();
-        const isButton = tag === "button" || role === "button" || role === "tab" || role === "option";
-        const isClickable = e.classList.contains("cursor-pointer") || e.getAttribute("tabindex") === "0";
-        return isButton || isClickable;
-      });
-      if (isAnyButton && text.length > 0 && text.length < 100 && !lowerText.includes("collapse") && !lowerText.includes("view ai")) {
-        clickTargets.push(el);
-      }
-    } catch (err) {
-      if (!err.message.includes('Execution context was destroyed')) throw err;
     }
-  }
-  return clickTargets;
+    // Then try card-like divs (with h3 inside)
+    const divs = document.querySelectorAll("div");
+    for (const el of divs) {
+      if (!el.querySelector("h3")) continue;
+      const t = (el.textContent || "").trim().replace(/\s+/g, " ");
+      if (t === targetText) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  }, { targetText: text, clickableQuery: CLICKABLE_QUERY });
+  return clicked;
 }
 
 /**
  * Discover routes AND capture content by clicking navigation elements.
  *
- * Handles TWO types of SPA navigation:
- *   1. URL changes (hash or path) — detected by comparing URLs
- *   2. Content-only changes (React state) — detected by content fingerprinting
+ * Strategy: collect all clickable labels ONCE, then iterate through them.
+ * For each label: reload the "from" page, find the element by text, click it,
+ * check if content changed, capture if so.
+ *
+ * This avoids stale element handles entirely — we never store Playwright ElementHandles
+ * across navigations.
  *
  * Builds a breadcrumb trail from the path of clicks: e.g. "Components/Badge".
- * fromBreadcrumb is the current page's breadcrumb (e.g. "Components"); new pages get
- * fromBreadcrumb + "/" + clickedLabel, or just clickedLabel when starting from landing.
  *
  * Returns an array of newly discovered route URLs.
+ *
+ * navigateToFromPage: async function that navigates the page back to the "from" page.
+ * excludeLabels: Set of button texts to skip (e.g. sidebar base-page buttons when crawling sub-pages).
  */
-async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb) {
+async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb, navigateToFromPage, excludeLabels) {
   const newRouteUrls = [];
   const effectiveBreadcrumb = fromBreadcrumb != null ? fromBreadcrumb : (navMap.get(fromKey)?.label ?? keyToDefaultLabel(fromKey));
   const isTopLevel = !fromKey || fromKey === "/" || fromKey === "#/" || fromKey === "#";
+
+  // Helper: go back to the "from" page (reload + click sidebar button if needed)
+  async function goBackToFromPage() {
+    if (navigateToFromPage) {
+      await navigateToFromPage();
+    } else {
+      await page.goto(BASE_URL, { waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded", timeout: TIMEOUT }).catch(() => {});
+      await page.waitForTimeout(RENDER_DELAY);
+    }
+  }
 
   // 1. Scan all <a href="..."> including hash links → just collect URLs
   const hrefs = await page.evaluate(() => {
@@ -621,200 +614,151 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb)
     }
   }
 
-  // 2. Click nav elements: capture content right when we navigate.
-  //    Re-query click targets after each navigation to avoid stale handles ("Execution context was destroyed").
-  let clickTargets = await getFilteredClickTargets(page);
-  const isComponentsListingPage = /#\/components\/?$|\/components\/?$/.test(routeKey(page.url()) || "");
+  // 2. Collect all clickable labels from the current page (just text, no handles)
+  const allLabels = await collectClickableLabels(page);
+  const contentFingerprint = await getContentFingerprint(page);
 
-  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${clickTargets.length} clickable elements`);
+  console.log(`    📍 Found ${newRouteUrls.length} href routes + ${allLabels.length} clickable labels`);
 
-  const clickedLabels = new Set();
-  let index = 0;
+  // 3. Click each label, check content, capture if changed
+  for (const { text, shortLabel } of allLabels) {
+    // Skip sidebar base-page buttons when crawling sub-pages
+    if (excludeLabels && excludeLabels.has(text)) continue;
 
-  while (index < clickTargets.length) {
-    const el = clickTargets[index];
+    // Use shortLabel (heading text) for route key derivation when available
+    const labelForKey = shortLabel || text;
+
+    // Skip labels we know are already captured
+    const cleaned = cleanLabelForBreadcrumb(labelForKey);
+    const potentialKey = isTopLevel
+      ? labelToRouteKey(labelForKey)
+      : deriveContentRouteKey(fromKey, labelForKey);
+    if (potentialKey && capturedRoutes.has(potentialKey)) continue;
+
+    // Click the element by finding it fresh in the DOM
+    const urlBefore = page.url();
+    const contentBefore = await getContentFingerprint(page);
+
+    const didClick = await clickByText(page, text);
+    if (!didClick) continue;
+
+    await page.waitForTimeout(1500);
+
+    let urlAfter, contentAfter;
     try {
-      let labelInfo;
-      try {
-        labelInfo = await el.evaluate(e => {
-          const text = (e.textContent || "").trim().replace(/\s+/g, " ");
-          return { text };
-        });
-      } catch (err) {
-        if (err.message.includes('Execution context was destroyed')) throw err;
-        console.log(`    ⚠️ Click error: ${err.message}`);
-        index++;
-        continue;
-      }
-
-      const dedupeKey = isComponentsListingPage && labelToComponentDetailRouteKey(labelInfo.text)
-        ? labelToComponentDetailRouteKey(labelInfo.text)
-        : labelInfo.text;
-      if (clickedLabels.has(dedupeKey)) {
-        index++;
-        continue;
-      }
-      clickedLabels.add(dedupeKey);
-
-      const urlBefore = page.url();
-      const contentBefore = await getContentFingerprint(page);
-
-      let clickSucceeded = false;
-      try {
-        await el.click({ timeout: 2000, force: true });
-        clickSucceeded = true;
-      } catch (err) {
-        if (err.message.includes('Execution context was destroyed')) throw err;
-        console.log(`    ⚠️ Click error: ${err.message}`);
-        index++;
-        continue;
-      }
-
-      if (!clickSucceeded) {
-        index++;
-        continue;
-      }
-
-      await page.waitForTimeout(1500);
-
-      let urlAfter, contentAfter;
-      try {
-        urlAfter = page.url();
-        contentAfter = await getContentFingerprint(page);
-      } catch (err) {
-        if (err.message.includes('Execution context was destroyed')) throw err;
-        console.log(`    ⚠️ Navigation error after click: ${err.message}`);
-        index++;
-        continue;
-      }
-
-      const urlChanged = urlAfter !== urlBefore;
-      const contentChanged = contentAfter !== contentBefore;
-
-      if (urlChanged || contentChanged) {
-        let key;
-        if (urlChanged) {
-          key = routeKey(urlAfter);
-        } else {
-          const isFromComponentsListing = fromKey && (
-            fromKey === "#/components" || fromKey === "/components"
-          );
-          if (isFromComponentsListing) {
-            key = labelToComponentDetailRouteKey(labelInfo.text) || labelToRouteKey(labelInfo.text);
-          } else {
-            key = deriveContentRouteKey(fromKey, labelInfo.text) || labelToRouteKey(labelInfo.text);
-          }
-        }
-
-        if (key && !capturedRoutes.has(key)) {
-          const displayLabel = cleanLabelForBreadcrumb(labelInfo.text);
-          const newBreadcrumb = isTopLevel ? displayLabel : (effectiveBreadcrumb + "/" + displayLabel);
-          console.log(`    🔀 Nav click → ${key} (${newBreadcrumb}) (url: ${urlChanged ? "changed" : "same"}, content: ${contentChanged ? "changed" : "same"})`);
-
-          navMap.set(key, { label: newBreadcrumb });
-
-          await page.waitForTimeout(RENDER_DELAY);
-          await page.waitForSelector("body *", { timeout: 5000 }).catch(() => {});
-
-          const fingerprint = await getContentFingerprint(page);
-          const duplicateFingerprint = [...capturedRoutes.values()].some(r => r._fingerprint && r._fingerprint === fingerprint);
-          if (duplicateFingerprint) {
-            console.log(`    ⏭️  Skip ${key} — content identical to existing page (fingerprint match)`);
-            if (urlChanged) {
-              await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
-              await page.waitForTimeout(800);
-            } else {
-              await page.goto(page.url(), { waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded", timeout: TIMEOUT });
-              await page.waitForTimeout(RENDER_DELAY);
-            }
-            clickTargets = await getFilteredClickTargets(page);
-            index = 0;
-            continue;
-          }
-
-          const [html, cssBlocks, assetUrls] = await Promise.all([
-            extractCleanHTML(page),
-            extractAllCSS(page),
-            extractAssetUrls(page),
-          ]);
-          const title = await page.title();
-
-          if (DOWNLOAD_ASSETS) {
-            for (const assetUrl of assetUrls) {
-              await downloadAsset(assetUrl, requestContext);
-            }
-            for (const cssBlock of cssBlocks) {
-              const urlMatches = cssBlock.match(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g) || [];
-              for (const m of urlMatches) {
-                const u = m.replace(/url\(["']?/, "").replace(/["']?\)/, "");
-                await downloadAsset(u, requestContext);
-              }
-            }
-          }
-
-          capturedRoutes.set(key, {
-            key,
-            url: urlChanged ? urlAfter : `${BASE_URL}#/${key.replace(/^#\//, "")}`,
-            title,
-            html,
-            css: cssBlocks.join("\n\n"),
-            newRoutes: [],
-            _fingerprint: fingerprint,
-          });
-          discoveredRoutes.add(key);
-          console.log(`    ✅ Captured ${key} via click`);
-
-          const subHrefs = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll("a[href]")).map(a => {
-              return { href: a.href, rawHref: a.getAttribute("href") };
-            });
-          });
-          for (const { href, rawHref } of subHrefs) {
-            let fullUrl;
-            if (rawHref && rawHref.startsWith("#")) {
-              fullUrl = new URL(BASE_URL);
-              fullUrl.hash = rawHref;
-            } else if (href && isInternalUrl(href)) {
-              fullUrl = new URL(href);
-            }
-            if (fullUrl) {
-              const k = routeKey(fullUrl.href);
-              if (k && !discoveredRoutes.has(k)) {
-                discoveredRoutes.add(k);
-                newRouteUrls.push(fullUrl.href);
-              }
-            }
-          }
-        }
-
-        if (urlChanged) {
-          await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
-          await page.waitForTimeout(800);
-        } else {
-          await page.goto(page.url(), {
-            waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
-            timeout: TIMEOUT,
-          });
-          await page.waitForTimeout(RENDER_DELAY);
-        }
-        clickTargets = await getFilteredClickTargets(page);
-        index = 0;
-        continue;
-      }
-      index++;
+      urlAfter = page.url();
+      contentAfter = await getContentFingerprint(page);
     } catch (err) {
-      if (err.message.includes('Execution context was destroyed')) {
-        try {
-          await page.goBack({ waitUntil: "domcontentloaded", timeout: 5000 }).catch(() => {});
-        } catch (_) {}
-        await page.waitForTimeout(500);
-        clickTargets = await getFilteredClickTargets(page);
-        index = 0;
+      // Page might have hard-navigated; go back to from page and continue
+      await goBackToFromPage();
+      continue;
+    }
+
+    const urlChanged = urlAfter !== urlBefore;
+    const contentChanged = contentAfter !== contentBefore;
+
+    if (!urlChanged && !contentChanged) continue; // click did nothing
+
+    // Determine the route key (use shortLabel/heading for clean slugs)
+    let key;
+    if (urlChanged) {
+      key = routeKey(urlAfter);
+    } else {
+      const isFromComponentsListing = fromKey && (
+        fromKey === "#/components" || fromKey === "/components"
+      );
+      if (isFromComponentsListing) {
+        key = labelToComponentDetailRouteKey(labelForKey) || labelToRouteKey(labelForKey);
+      } else if (isTopLevel) {
+        key = labelToRouteKey(labelForKey);
       } else {
-        console.log(`    ⚠️ Click error: ${err.message}`);
-        index++;
+        key = deriveContentRouteKey(fromKey, labelForKey) || labelToRouteKey(labelForKey);
       }
     }
+
+    if (!key || capturedRoutes.has(key)) {
+      // Navigate back to the "from" page before trying the next label
+      await goBackToFromPage();
+      continue;
+    }
+
+    const displayLabel = cleanLabelForBreadcrumb(labelForKey);
+    const newBreadcrumb = isTopLevel ? displayLabel : (effectiveBreadcrumb + "/" + displayLabel);
+    console.log(`    🔀 Nav click → ${key} (${newBreadcrumb}) (url: ${urlChanged ? "changed" : "same"}, content: ${contentChanged ? "changed" : "same"})`);
+
+    navMap.set(key, { label: newBreadcrumb });
+
+    // Wait for content to fully render
+    await page.waitForTimeout(RENDER_DELAY);
+    await page.waitForSelector("body *", { timeout: 5000 }).catch(() => {});
+
+    // Content fingerprint to detect duplicate content
+    const fingerprint = await getContentFingerprint(page);
+    const duplicateFingerprint = [...capturedRoutes.values()].some(r => r._fingerprint && r._fingerprint === fingerprint);
+    if (duplicateFingerprint) {
+      console.log(`    ⏭️  Skip ${key} — content identical to existing page (fingerprint match)`);
+      await goBackToFromPage();
+      continue;
+    }
+
+    // Capture content
+    const [html, cssBlocks, assetUrls] = await Promise.all([
+      extractCleanHTML(page),
+      extractAllCSS(page),
+      extractAssetUrls(page),
+    ]);
+    const title = await page.title();
+
+    if (DOWNLOAD_ASSETS) {
+      for (const assetUrl of assetUrls) {
+        await downloadAsset(assetUrl, requestContext);
+      }
+      for (const cssBlock of cssBlocks) {
+        const urlMatches = cssBlock.match(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g) || [];
+        for (const m of urlMatches) {
+          const u = m.replace(/url\(["']?/, "").replace(/["']?\)/, "");
+          await downloadAsset(u, requestContext);
+        }
+      }
+    }
+
+    capturedRoutes.set(key, {
+      key,
+      url: urlChanged ? urlAfter : `${BASE_URL}#/${key.replace(/^#\//, "")}`,
+      title,
+      html,
+      css: cssBlocks.join("\n\n"),
+      newRoutes: [],
+      _fingerprint: fingerprint,
+    });
+    discoveredRoutes.add(key);
+    console.log(`    ✅ Captured ${key} via click`);
+
+    // Discover sub-links from this page
+    const subHrefs = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll("a[href]")).map(a => {
+        return { href: a.href, rawHref: a.getAttribute("href") };
+      });
+    });
+    for (const { href, rawHref } of subHrefs) {
+      let fullUrl;
+      if (rawHref && rawHref.startsWith("#")) {
+        fullUrl = new URL(BASE_URL);
+        fullUrl.hash = rawHref;
+      } else if (href && isInternalUrl(href)) {
+        fullUrl = new URL(href);
+      }
+      if (fullUrl) {
+        const k = routeKey(fullUrl.href);
+        if (k && !discoveredRoutes.has(k)) {
+          discoveredRoutes.add(k);
+          newRouteUrls.push(fullUrl.href);
+        }
+      }
+    }
+
+    // Navigate back to the "from" page so we can click the next label
+    await goBackToFromPage();
   }
 
   return newRouteUrls;
@@ -1082,11 +1026,15 @@ function buildNavBar(currentKey) {
     return `<a href="${rel}" class="nav-item${depthClass}${activeClass}">${label}</a>`;
   }
 
-  function keyToLabel(key) {
-    // Use breadcrumb from navMap (e.g. "Components/Badge") so sidebar shows full path
+  function keyToLabel(key, showShort = false) {
+    // Use breadcrumb from navMap (e.g. "Components/Badge")
     if (navMap.has(key)) {
       const raw = navMap.get(key).label;
-      if (raw.includes("/")) return raw; // full breadcrumb: show as-is
+      if (showShort && raw.includes("/")) {
+        // Under a section heading, show only the last segment: "Badge"
+        return raw.split("/").pop().trim();
+      }
+      if (raw.includes("/")) return raw;
       const cleaned = raw.replace(/^[a-z_]+\s+/, "");
       return cleaned || raw;
     }
@@ -1097,9 +1045,9 @@ function buildNavBar(currentKey) {
   nav += `  <div class="static-nav-brand">Site Navigation</div>\n`;
   nav += `  <div class="static-nav-section">\n`;
 
-  // Home link
+  // Home/Overview link
   if (capturedRoutes.has("/")) {
-    nav += `    ${makeLink("/", "Home")}\n`;
+    nav += `    ${makeLink("/", navMap.get("/")?.label || "Overview")}\n`;
   }
 
   // Main section pages
@@ -1117,12 +1065,12 @@ function buildNavBar(currentKey) {
     }
   }
 
-  // Components
+  // Components — show only the last part of the breadcrumb (e.g. "Badge" not "Components/Badge")
   if (componentRoutes.length > 0) {
     nav += `  </div>\n  <div class="static-nav-section">\n`;
     nav += `    <div class="static-nav-heading">Components</div>\n`;
     for (const key of componentRoutes.sort()) {
-      nav += `    ${makeLink(key, keyToLabel(key))}\n`;
+      nav += `    ${makeLink(key, keyToLabel(key, true))}\n`;
     }
   }
 
@@ -1303,58 +1251,106 @@ async function main() {
   navMap.set(landingKey, { label: "Overview" });
   console.log(`  ✅ Landing: ${landingKey} (fingerprint: ${landingFingerprint.slice(0, 40)}...)\n`);
 
-  // ── Step 1b: Seed queue from sidebar only (base pages: Overview, Colors, Typography, Components, etc.) ──
+  // ── Step 1b: Seed base pages from sidebar buttons ──
   const seeded = await seedSidebarRoutesFromPage(page);
-  for (const { key, url, label } of seeded) {
-    if (key && !discoveredRoutes.has(key)) {
-      discoveredRoutes.add(key);
-      navMap.set(key, { label });
+  for (const item of seeded) {
+    if (item.key && !discoveredRoutes.has(item.key)) {
+      discoveredRoutes.add(item.key);
+      navMap.set(item.key, { label: item.label });
     }
   }
-  const seededUrls = seeded.map(s => s.url);
   console.log(`  🌱 Seeded ${seeded.length} sidebar base pages: ${seeded.map(s => s.label).join(", ")}\n`);
 
-  // ── Step 2: Discover routes by clicking nav elements & capture (breadcrumb starts at landing) ────────
-  console.log("🔍 Discovering routes via navigation clicks...\n");
-  const initialRoutes = await discoverAndCapture(page, context.request, landingKey, "Overview");
-  console.log(`\n  📍 Discovered ${initialRoutes.length} additional route URLs\n`);
+  // ── Step 2: Click each sidebar button, capture the page, then crawl its children ────────
+  console.log("🔍 Crawling base pages via sidebar button clicks...\n");
 
-  // ── Step 3: Build queue (seeded + discovered) and capture remaining; crawl down from each ────
-  const routeQueue = seededUrls.concat(initialRoutes);
-  for (const r of routeQueue) {
-    discoveredRoutes.add(routeKey(r));
-  }
-  console.log(`  📋 Queue: ${routeQueue.length} URLs to process\n`);
+  for (const item of seeded) {
+    if (capturedRoutes.size >= MAX_PAGES) break;
+    if (capturedRoutes.has(item.key)) continue;
 
-  while (routeQueue.length > 0 && capturedRoutes.size < MAX_PAGES) {
-    const url = routeQueue.shift();
-    const key = routeKey(url);
+    // Reload the site to get back to landing (clean state)
+    await page.goto(BASE_URL, {
+      waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
+      timeout: TIMEOUT,
+    });
+    await page.waitForTimeout(RENDER_DELAY);
 
-    if (!key || capturedRoutes.has(key)) continue;
+    // Click the sidebar button by its text
+    const contentBefore = await getContentFingerprint(page);
+    const didClick = await clickByText(page, item.buttonText);
+    if (!didClick) {
+      console.log(`  ⚠️ Could not find sidebar button: "${item.buttonText}"`);
+      continue;
+    }
 
-    const result = await captureRoute(page, url, context.request);
+    await page.waitForTimeout(RENDER_DELAY);
+    const contentAfter = await getContentFingerprint(page);
+    if (contentAfter === contentBefore) {
+      console.log(`  ⏭️  Skipping ${item.key} — content didn't change after click`);
+      continue;
+    }
 
-    if (result && result.newRoutes) {
-      for (const newUrl of result.newRoutes) {
-        const newKey = routeKey(newUrl);
-        if (newKey && !discoveredRoutes.has(newKey)) {
-          discoveredRoutes.add(newKey);
-          routeQueue.push(newUrl);
+    // Check for duplicate content
+    const fingerprint = await getContentFingerprint(page);
+    const duplicateFingerprint = [...capturedRoutes.values()].some(r => r._fingerprint && r._fingerprint === fingerprint);
+    if (duplicateFingerprint) {
+      console.log(`  ⏭️  Skipping ${item.key} — content identical to existing page`);
+      continue;
+    }
+
+    // Capture the page
+    const [html, cssBlocks, assetUrls] = await Promise.all([
+      extractCleanHTML(page),
+      extractAllCSS(page),
+      extractAssetUrls(page),
+    ]);
+    const title = await page.title();
+
+    if (DOWNLOAD_ASSETS) {
+      for (const assetUrl of assetUrls) {
+        await downloadAsset(assetUrl, context.request);
+      }
+      for (const cssBlock of cssBlocks) {
+        const urlMatches = cssBlock.match(/url\(["']?(https?:\/\/[^"')]+)["']?\)/g) || [];
+        for (const m of urlMatches) {
+          const u = m.replace(/url\(["']?/, "").replace(/["']?\)/, "");
+          await downloadAsset(u, context.request);
         }
       }
     }
 
-    // After capturing a page, crawl down: discover buttons/links and capture with breadcrumb trail
-    if (result) {
-      const pageBreadcrumb = navMap.get(key)?.label ?? keyToDefaultLabel(key);
-      const moreRoutes = await discoverAndCapture(page, context.request, key, pageBreadcrumb);
-      for (const newUrl of moreRoutes) {
-        const newKey = routeKey(newUrl);
-        if (newKey && !discoveredRoutes.has(newKey)) {
-          discoveredRoutes.add(newKey);
-          routeQueue.push(newUrl);
-        }
-      }
+    capturedRoutes.set(item.key, {
+      key: item.key,
+      url: `${BASE_URL}${item.key}`,
+      title,
+      html,
+      css: cssBlocks.join("\n\n"),
+      newRoutes: [],
+      _fingerprint: fingerprint,
+    });
+    discoveredRoutes.add(item.key);
+    console.log(`  ✅ Captured base page: ${item.key} (${item.label})`);
+
+    // Now crawl deeper: discover buttons/links on this page and capture sub-pages
+    if (capturedRoutes.size < MAX_PAGES) {
+      const pageBreadcrumb = item.label;
+      const buttonText = item.buttonText;
+      // Function to navigate back to this base page: reload site + click the sidebar button
+      const navigateToThisPage = async () => {
+        await page.goto(BASE_URL, {
+          waitUntil: WAIT_FOR_NETWORK ? "networkidle" : "domcontentloaded",
+          timeout: TIMEOUT,
+        });
+        await page.waitForTimeout(RENDER_DELAY);
+        await clickByText(page, buttonText);
+        await page.waitForTimeout(RENDER_DELAY);
+      };
+      // Exclude sidebar base-page buttons so clicking "Typography" from "Colors" page
+      // doesn't get captured as a child of Colors
+      const sidebarLabels = new Set(seeded.map(s => s.buttonText));
+      console.log(`  🔍 Crawling children of ${item.key}...`);
+      const moreRoutes = await discoverAndCapture(page, context.request, item.key, pageBreadcrumb, navigateToThisPage, sidebarLabels);
+      console.log(`    📍 Discovered ${moreRoutes.length} additional URLs from ${item.key}\n`);
     }
   }
 
