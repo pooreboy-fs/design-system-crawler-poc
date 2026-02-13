@@ -35,6 +35,7 @@ const capturedRoutes = new Map(); // route key → { url, html, css, title, asse
 const downloadedAssets = new Map(); // original URL → local path
 const discoveredRoutes = new Set(); // all route keys we've seen
 const navMap = new Map(); // route key → { label, icon } for building navigation
+let siteExternalLinks = []; // external <link> tags from <head> (shared by all pages)
 
 // ── Resilient Navigation ──────────────────────────────────────────────────
 
@@ -178,6 +179,35 @@ async function extractAllCSS(page) {
       }
     }
     return results;
+  });
+}
+
+// ── External Link Extraction ──────────────────────────────────────────────
+
+/**
+ * Extract external <link> tags from the page's <head> that we need to preserve.
+ * This captures Google Fonts, Material Icons, preconnect hints, etc.
+ * Returns an array of HTML strings like '<link rel="stylesheet" href="...">'.
+ */
+async function extractExternalLinks(page) {
+  return await page.evaluate(() => {
+    const links = [];
+    const seen = new Set();
+    document.querySelectorAll('head link[rel="stylesheet"], head link[rel="preconnect"], head link[rel="dns-prefetch"]').forEach(link => {
+      const href = link.getAttribute("href") || "";
+      if (seen.has(href)) return;
+      seen.add(href);
+      // Only keep external CDN links (fonts, icons, etc.)
+      if (href.includes("fonts.googleapis.com") ||
+          href.includes("fonts.gstatic.com") ||
+          href.includes("material") ||
+          href.includes("typekit") ||
+          link.getAttribute("rel") === "preconnect" ||
+          link.getAttribute("rel") === "dns-prefetch") {
+        links.push(link.outerHTML);
+      }
+    });
+    return links;
   });
 }
 
@@ -750,6 +780,7 @@ async function discoverAndCapture(page, requestContext, fromKey, fromBreadcrumb,
       title,
       html,
       css: cssBlocks.join("\n\n"),
+      externalLinks: siteExternalLinks,
       newRoutes: [],
       _fingerprint: fingerprint,
     });
@@ -880,6 +911,7 @@ async function captureRoute(page, url, requestContext) {
       title,
       html,
       css: cssBlocks.join("\n\n"),
+      externalLinks: siteExternalLinks,
       newRoutes,
       _fingerprint: finalFingerprint,
     };
@@ -1181,6 +1213,38 @@ function buildPage(route) {
   html = rewriteAssetUrls(html, route.key);
   let css = rewriteAssetUrls(route.css, route.key);
 
+  // ── Fix @import rules: must be at top of stylesheet or browsers ignore them ──
+  // Extract @import rules and convert them to <link> tags (more reliable, parallel loading)
+  const importRegex = /@import\s+url\(["']?([^"')]+)["']?\)\s*;?/g;
+  const importLinks = [];
+  const seen = new Set();
+  let match;
+  while ((match = importRegex.exec(css)) !== null) {
+    const url = match[1];
+    if (!seen.has(url)) {
+      seen.add(url);
+      importLinks.push(`  <link rel="stylesheet" href="${url}">`);
+    }
+  }
+  // Remove @import rules from inline CSS (they're now <link> tags)
+  css = css.replace(/@import\s+url\(["']?[^"')]+["']?\)\s*;?/g, "").trim();
+
+  // ── Fix relative font URLs: make them absolute to the source site ──
+  // Paths like url(/_woff/v2/...) need to resolve against the original domain
+  const baseOrigin = new URL(BASE_URL).origin;
+  css = css.replace(/url\(["']?\/((?!\/)[^"')]+)["']?\)/g, `url("${baseOrigin}/$1")`);
+
+  // ── Collect external <link> tags preserved from the original page ──
+  const externalLinks = (route.externalLinks || [])
+    .filter(l => {
+      // Deduplicate against @import-derived links
+      const hrefMatch = l.match(/href=["']([^"']+)["']/);
+      return !hrefMatch || !seen.has(hrefMatch[1]);
+    });
+
+  // Merge all external links (deduped)
+  const allLinks = [...new Set([...externalLinks, ...importLinks])];
+
   const safeTitle = (route.title || "Untitled")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
@@ -1193,6 +1257,7 @@ function buildPage(route) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${safeTitle}</title>
+${allLinks.join("\n")}
   <style>
 ${css}
 ${NAV_CSS}
@@ -1236,13 +1301,15 @@ async function main() {
   await safeGoto(page, BASE_URL);
   await page.waitForTimeout(RENDER_DELAY);
 
-  // Capture the landing page first
+  // Capture the landing page first (also extract external links — shared by all pages)
   const landingKey = routeKey(page.url()) || "/";
   const landingHtml = await extractCleanHTML(page);
   const landingCss = await extractAllCSS(page);
   const landingTitle = await page.title();
   const landingAssets = await extractAssetUrls(page);
   const landingFingerprint = await getContentFingerprint(page);
+  siteExternalLinks = await extractExternalLinks(page);
+  console.log(`  🔗 Extracted ${siteExternalLinks.length} external links from <head>`);
 
   if (DOWNLOAD_ASSETS) {
     for (const u of landingAssets) await downloadAsset(u, context.request);
@@ -1260,6 +1327,7 @@ async function main() {
     title: landingTitle,
     html: landingHtml,
     css: landingCss.join("\n\n"),
+    externalLinks: siteExternalLinks,
     newRoutes: [],
     _fingerprint: landingFingerprint,
   });
@@ -1338,6 +1406,7 @@ async function main() {
       title,
       html,
       css: cssBlocks.join("\n\n"),
+      externalLinks: siteExternalLinks,
       newRoutes: [],
       _fingerprint: fingerprint,
     });
